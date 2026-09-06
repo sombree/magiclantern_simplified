@@ -56,6 +56,9 @@ int compositor_layer_setup();
  */
 #define XIMR_FLAGS_LAYER_RGBA 0x5040100
 
+/* XCM type-2 1-byte indexed layer, used with a global XCM LUT. */
+#define XIMR_FLAGS_LAYER_INDEXED_8BPP 0x02010100
+
 // This shouldn't change, but...
 #ifndef CANON_GUI_LAYER_ID
 #define CANON_GUI_LAYER_ID 0
@@ -67,6 +70,38 @@ extern int _rgb_vram_layer_id; // = CANON_GUI_LAYER_ID;
 #ifdef CONFIG_COMPOSITOR_XCM
 extern void* _pXCM;
 extern struct MARV *XCM_GetSourceSurface(void *pXCM, uint32_t layer_id);
+#endif
+
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+#if !defined(CONFIG_COMPOSITOR_XCM_V2)
+#error "Native indexed XCM requires CONFIG_COMPOSITOR_XCM_V2"
+#endif
+
+enum compositor_native_layer_role
+{
+    COMPOSITOR_NATIVE_LAYER_MENU = 0,
+    COMPOSITOR_NATIVE_LAYER_OVERLAY = 1,
+    COMPOSITOR_NATIVE_LAYER_COUNT = 2,
+};
+
+int compositor_native_indexed_prepare(int role, uint8_t *indexed_base);
+int compositor_native_indexed_hide_all(void);
+void compositor_native_indexed_menu_enter(void);
+void compositor_native_indexed_menu_exit(void);
+void compositor_native_indexed_disable(void);
+int compositor_native_indexed_is_active(void);
+
+/*
+ * Platform policy required by CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED.
+ *
+ * The core manages ML XCM layers. Platforms manage the global LUT state and
+ * any Canon-owned layers that must be hidden while the ML menu is active.
+ */
+int compositor_native_indexed_platform_lut_install(void *lut);
+void compositor_native_indexed_platform_lut_restore(void);
+void compositor_native_indexed_platform_menu_enter(void);
+void compositor_native_indexed_platform_menu_exit(void);
+void compositor_native_indexed_platform_menu_reassert(void);
 #endif
 
 #endif

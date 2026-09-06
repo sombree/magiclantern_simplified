@@ -139,7 +139,333 @@ extern uint32_t VMIX_LayersEnable[XIMR_MAX_LAYERS]; // R only, DNE on SX740
 extern uint32_t XCM_SetSourceSurface(void * pXCM, uint layer, struct MARV * pMARV);
 extern uint32_t XCM_SetSourceArea(void * pXCM, uint layer, uint16_t srcX, uint16_t srcY, uint16_t srcW, uint16_t srcH);
 extern uint32_t XOC_SetLayerEnable(int p1, int p2, uint layer, int p4);
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+extern uint32_t XCM_MakeContext(void *pXCM, uint32_t arg1, uint32_t arg2);
+extern uint32_t XCM_SetLayerOffset(
+    void *pXCM, uint32_t layer, uint16_t x, uint16_t y);
+#endif
 #endif // CONFIG_COMPOSITOR_XCM_V2
+
+
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+/*
+ * Native 8-bit indexed XCM backend.
+ *
+ * Platforms opt in explicitly and provide the small platform policy hooks
+ * declared in compositor.h. The core owns ML layers and their MARV state;
+ * platform code owns global LUT state and Canon GUI-layer policy.
+ */
+#define XCM_NATIVE_LUT_ENTRIES 256u
+#define XCM_NATIVE_LUT_BYTES \
+    (XCM_NATIVE_LUT_ENTRIES * sizeof(uint32_t))
+
+struct native_indexed_layer
+{
+    struct MARV marv;
+    int layer_id;
+};
+
+static struct native_indexed_layer native_indexed_layers[
+    COMPOSITOR_NATIVE_LAYER_COUNT] = {
+        [COMPOSITOR_NATIVE_LAYER_MENU] = { .layer_id = -1 },
+        [COMPOSITOR_NATIVE_LAYER_OVERLAY] = { .layer_id = -1 },
+    };
+
+static uint8_t native_indexed_lut_storage[XCM_NATIVE_LUT_BYTES + 0xffu]
+    __attribute__((aligned(64)));
+static int native_indexed_lut_active = 0;
+
+static volatile uint32_t *native_indexed_lut_uncached(void)
+{
+    uintptr_t p = (uintptr_t)native_indexed_lut_storage;
+    p = (p + 0xffu) & ~(uintptr_t)0xffu;
+    return (volatile uint32_t *)UNCACHEABLE((void *)p);
+}
+
+static int native_clamp_i32(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+/* Convert ML's 0xAARRGGBB palette entries to XCM type-2 AAVVUUYY. */
+static uint32_t native_argb_to_avuy(uint32_t argb)
+{
+    int a = (int)((argb >> 24) & 0xffu);
+    int r = (int)((argb >> 16) & 0xffu);
+    int g = (int)((argb >> 8) & 0xffu);
+    int b = (int)(argb & 0xffu);
+    int y = native_clamp_i32((217 * r + 732 * g + 73 * b) / 1024,
+                             0, 255);
+    int u = native_clamp_i32(
+        (-117 * r - 394 * g + 512 * b) / 1024,
+        -128, 127) + 128;
+    int v = native_clamp_i32(
+        (512 * r - 465 * g - 46 * b) / 1024,
+        -128, 127) + 128;
+
+    return ((uint32_t)a << 24) |
+           ((uint32_t)v << 16) |
+           ((uint32_t)u << 8) |
+           (uint32_t)y;
+}
+
+static void native_indexed_build_lut(void)
+{
+    volatile uint32_t *lut = native_indexed_lut_uncached();
+    for (uint32_t i = 0; i < XCM_NATIVE_LUT_ENTRIES; i++)
+        lut[i] = native_argb_to_avuy(indexed2rgb((uint8_t)i));
+}
+
+static int native_indexed_ensure_lut(void)
+{
+    if (!_pXCM)
+        return 1;
+
+    if (!native_indexed_lut_active)
+        native_indexed_build_lut();
+
+    int rc = compositor_native_indexed_platform_lut_install(
+        (void *)native_indexed_lut_uncached());
+    if (rc != 0)
+        return 2;
+
+    native_indexed_lut_active = 1;
+    return 0;
+}
+
+static int native_indexed_role_valid(int role)
+{
+    return role >= 0 && role < COMPOSITOR_NATIVE_LAYER_COUNT;
+}
+
+static int native_indexed_create_layer(int role, uint8_t *indexed_base)
+{
+    if (!_pXCM || !indexed_base || !rgb_vram_info ||
+        !native_indexed_role_valid(role))
+        return 1;
+
+    if (_rgb_vram_layer_id == CANON_GUI_LAYER_ID)
+        return 7;
+
+    struct native_indexed_layer *slot = &native_indexed_layers[role];
+
+    if (slot->layer_id >= 0)
+    {
+        struct MARV *owner = XCM_GetSourceSurface(
+            _pXCM, (uint32_t)slot->layer_id);
+        if (owner == &slot->marv || owner == NULL)
+            return 0;
+
+        slot->layer_id = -1;
+    }
+
+    int layer = XIMR_MAX_LAYERS - 1;
+    while (layer >= 0)
+    {
+        if (layer != _rgb_vram_layer_id &&
+            XCM_GetSourceSurface(_pXCM, (uint32_t)layer) == NULL)
+            break;
+        layer--;
+    }
+    if (layer < 0)
+        return 2;
+
+    slot->marv.signature = 0x5652414D;
+    slot->marv.bitmap_data = (uint8_t *)UNCACHEABLE(indexed_base);
+    slot->marv.opacity_data = 0;
+    slot->marv.flags = XIMR_FLAGS_LAYER_INDEXED_8BPP;
+    slot->marv.width = BMPPITCH;
+    slot->marv.height = BMP_VRAM_SIZE / BMPPITCH;
+    slot->marv.pmem = 0;
+
+    if (XCM_SetSourceSurface(_pXCM, (uint)layer, &slot->marv) != 0)
+        return 4;
+
+    if (XCM_SetSourceArea(
+            _pXCM, (uint)layer,
+            (uint16_t)(-BMP_W_MINUS), (uint16_t)(-BMP_H_MINUS),
+            (uint16_t)(BMP_W_PLUS + BMP_W_MINUS),
+            (uint16_t)(BMP_H_PLUS + BMP_H_MINUS)) != 0)
+    {
+        XCM_SetSourceSurface(_pXCM, (uint)layer, NULL);
+        return 5;
+    }
+
+    if (XCM_SetLayerOffset(_pXCM, (uint32_t)layer, 0, 0) != 0)
+    {
+        XCM_SetSourceSurface(_pXCM, (uint)layer, NULL);
+        return 6;
+    }
+
+    if (XOC_SetLayerEnable(0, 0, (uint)layer, 0) != 0)
+    {
+        XCM_SetSourceSurface(_pXCM, (uint)layer, NULL);
+        return 8;
+    }
+
+    slot->layer_id = layer;
+    DryosDebugMsg(0, 15, "Native XCM layer role=%d layer=%d",
+        role, layer);
+    return 0;
+}
+
+static int native_indexed_set_owned_visible(int role, int enable)
+{
+    if (!native_indexed_role_valid(role))
+        return 1;
+
+    struct native_indexed_layer *slot = &native_indexed_layers[role];
+    if (slot->layer_id < 0)
+        return 0;
+
+    if (XCM_GetSourceSurface(_pXCM, (uint32_t)slot->layer_id) !=
+        &slot->marv)
+    {
+        slot->layer_id = -1;
+        return 2;
+    }
+
+    return (int)XOC_SetLayerEnable(
+        0, 0, (uint)slot->layer_id, enable ? 1 : 0);
+}
+
+void compositor_native_indexed_menu_enter(void)
+{
+    compositor_native_indexed_platform_menu_enter();
+}
+
+void compositor_native_indexed_menu_exit(void)
+{
+    compositor_native_indexed_platform_menu_exit();
+}
+
+int compositor_native_indexed_prepare(int role, uint8_t *indexed_base)
+{
+    if (!_pXCM || !indexed_base || !rgb_vram_info ||
+        !native_indexed_role_valid(role))
+        return 10;
+
+    int rc = native_indexed_ensure_lut();
+    if (rc != 0)
+        return 31 + rc;
+
+    rc = native_indexed_create_layer(role, indexed_base);
+    if (rc != 0)
+        return 20 + rc;
+
+    struct native_indexed_layer *slot = &native_indexed_layers[role];
+    if (slot->layer_id < 0)
+        return 29;
+
+    struct MARV *owner = XCM_GetSourceSurface(
+        _pXCM, (uint32_t)slot->layer_id);
+    if (owner != NULL && owner != &slot->marv)
+    {
+        slot->layer_id = -1;
+        return 30;
+    }
+
+    slot->marv.bitmap_data = (uint8_t *)UNCACHEABLE(indexed_base);
+    rc = (int)XCM_SetSourceSurface(
+        _pXCM, (uint)slot->layer_id, &slot->marv);
+    if (rc != 0)
+        return 40;
+
+    rc = (int)XCM_SetSourceArea(
+        _pXCM, (uint)slot->layer_id,
+        (uint16_t)(-BMP_W_MINUS), (uint16_t)(-BMP_H_MINUS),
+        (uint16_t)(BMP_W_PLUS + BMP_W_MINUS),
+        (uint16_t)(BMP_H_PLUS + BMP_H_MINUS));
+    if (rc != 0)
+        return 41;
+
+    rc = (int)XCM_SetLayerOffset(
+        _pXCM, (uint32_t)slot->layer_id, 0, 0);
+    if (rc != 0)
+        return 42;
+
+    rc = (int)XOC_SetLayerEnable(0, 0, (uint)_rgb_vram_layer_id, 0);
+    if (rc != 0)
+        return 43;
+
+    int other = role == COMPOSITOR_NATIVE_LAYER_MENU ?
+        COMPOSITOR_NATIVE_LAYER_OVERLAY : COMPOSITOR_NATIVE_LAYER_MENU;
+    native_indexed_set_owned_visible(other, 0);
+
+    rc = native_indexed_set_owned_visible(role, 1);
+    if (rc != 0)
+    {
+        XOC_SetLayerEnable(0, 0, (uint)_rgb_vram_layer_id, 1);
+        return 44;
+    }
+
+    if (role == COMPOSITOR_NATIVE_LAYER_MENU)
+        compositor_native_indexed_platform_menu_reassert();
+
+    rc = (int)XCM_MakeContext(_pXCM, 0, 0);
+    if (rc != 0)
+        return 50;
+
+    return 0;
+}
+
+int compositor_native_indexed_hide_all(void)
+{
+    if (!_pXCM)
+        return 1;
+
+    native_indexed_set_owned_visible(COMPOSITOR_NATIVE_LAYER_MENU, 0);
+    native_indexed_set_owned_visible(COMPOSITOR_NATIVE_LAYER_OVERLAY, 0);
+
+    if (_rgb_vram_layer_id != CANON_GUI_LAYER_ID)
+        XOC_SetLayerEnable(0, 0, (uint)_rgb_vram_layer_id, 0);
+
+    return (int)XCM_MakeContext(_pXCM, 0, 0);
+}
+
+void compositor_native_indexed_disable(void)
+{
+    if (!_pXCM)
+        return;
+
+    compositor_native_indexed_menu_exit();
+
+    if (_rgb_vram_layer_id != CANON_GUI_LAYER_ID)
+        XOC_SetLayerEnable(0, 0, (uint)_rgb_vram_layer_id, 1);
+
+    for (int role = 0; role < COMPOSITOR_NATIVE_LAYER_COUNT; role++)
+    {
+        struct native_indexed_layer *slot = &native_indexed_layers[role];
+        int layer = slot->layer_id;
+        if (layer >= 0 &&
+            XCM_GetSourceSurface(_pXCM, (uint32_t)layer) == &slot->marv)
+        {
+            XOC_SetLayerEnable(0, 0, (uint)layer, 0);
+            XCM_SetSourceSurface(_pXCM, (uint)layer, NULL);
+        }
+        slot->layer_id = -1;
+    }
+
+    if (native_indexed_lut_active)
+        compositor_native_indexed_platform_lut_restore();
+    native_indexed_lut_active = 0;
+    XCM_MakeContext(_pXCM, 0, 0);
+}
+
+int compositor_native_indexed_is_active(void)
+{
+    if (native_indexed_lut_active)
+        return 1;
+
+    for (int role = 0; role < COMPOSITOR_NATIVE_LAYER_COUNT; role++)
+        if (native_indexed_layers[role].layer_id >= 0)
+            return 1;
+
+    return 0;
+}
+#endif
 
 /*
  * CONFIG_COMPOSITOR_XCM_V2 models use a single array of structures, and won't
