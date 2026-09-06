@@ -881,11 +881,43 @@ extern MENU_SELECT_FUNC(tasks_toggle_flags);
 
 extern int show_cpu_usage_flag;
 
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+static MENU_SELECT_FUNC(ml_indexed_renderer_select)
+{
+    int old_mode = ml_indexed_renderer_mode;
+    menu_numeric_toggle(priv, delta, 0, 1);
+
+    if (ml_indexed_renderer_mode != old_mode)
+    {
+        rgba_buffer_clear();
+        if (ml_indexed_renderer_mode && gui_menu_shown())
+            bmp_native_xcm_menu_enter();
+        ml_refresh_display_needed = 1;
+
+        DryosDebugMsg(0, 15, "ML indexed renderer: %s",
+            ml_indexed_renderer_mode ? "Native XCM" : "OFF");
+    }
+}
+#endif
+
 static int gui_events_show = 0;
 static MENU_SELECT_FUNC(gui_events_toggle);
 
 static struct menu_entry debug_menus[] = {
     MENU_PLACEHOLDER("File Manager"),
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    {
+        .name = "ML indexed renderer",
+        .priv = &ml_indexed_renderer_mode,
+        .min = 0,
+        .max = 1,
+        .choices = CHOICES("OFF", "Native XCM"),
+        .select = ml_indexed_renderer_select,
+        .help = "OFF: established renderer. Native XCM: direct 8-bpp XCM layer.",
+        .help2 = "Native XCM keeps the RGBA renderer available as fallback.",
+        .advanced = 1,
+    },
+#endif
 #ifdef CONFIG_HEXDUMP
     {
         .name = "Memory Browser",
