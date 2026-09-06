@@ -127,7 +127,10 @@
 
 #define YUV422_HD_BUFFER_DMA_ADDR 0x0 // it expects this to be shamem_read(some_DMA_ADDR)
 
-#define XIMR_CONTEXT 0x00c0f310
+// address of XimrContext structure to redraw in FEATURE_VRAM_RGBA
+// XCM + 0x10 is first XC
+#define XCM_PTR *(unsigned int *)0xFF78
+#define XIMR_CONTEXT ((unsigned int *)(XCM_PTR + 0x10))
 
 /* WRONG: copied straight from 200d/50d */
 // Definitely wrong / hacks / no testing at all:
