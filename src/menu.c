@@ -51,6 +51,18 @@
 #define DOUBLE_BUFFERING 1
 #endif
 
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+static int menu_native_xcm_active(void)
+{
+    return ml_indexed_renderer_mode != 0;
+}
+#else
+static int menu_native_xcm_active(void)
+{
+    return 0;
+}
+#endif
+
 //~ #define MENU_KEYHELP_Y_POS (menu_lv_transparent_mode ? 425 : 430)
 #define MENU_HELP_Y_POS 435
 #define MENU_HELP_Y_POS_2 458
@@ -4739,6 +4751,19 @@ menu_redraw_do()
     if (gui_state == GUISTATE_MENUDISP)
         return;
 
+    int native_menu_frame = 0;
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    if (menu_native_xcm_active())
+    {
+        native_menu_frame = bmp_native_xcm_menu_frame_begin();
+        if (!native_menu_frame)
+        {
+            DryosDebugMsg(0, 15, "Native XCM menu frame begin failed");
+            return;
+        }
+    }
+#endif
+
     if (menu_help_active)
     {
         menu_help_redraw();
@@ -4751,7 +4776,7 @@ menu_redraw_do()
         if (menu_lv_transparent_mode && edit_mode)
             edit_mode = 0;
 
-        if (DOUBLE_BUFFERING)
+        if (DOUBLE_BUFFERING && !native_menu_frame)
         {
             // draw to mirror buffer to avoid flicker
             //~ bmp_idle_copy(0); // no need, drawing is fullscreen anyway
@@ -4770,7 +4795,8 @@ menu_redraw_do()
         {
             bmp_fill( 0, 0, 0, 720, 480 );
             #ifdef FEATURE_VRAM_RGBA
-            clrscr();
+            if (!native_menu_frame)
+                clrscr();
             #endif
 
             /*
@@ -4789,7 +4815,12 @@ menu_redraw_do()
         }
         else
         {
-            bmp_fill(COLOR_BLACK, 0, 40, 720, 400 );
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+            if (native_menu_frame)
+                bmp_fill(COLOR_BLACK, 0, 0, 720, 480);
+            else
+#endif
+                bmp_fill(COLOR_BLACK, 0, 40, 720, 400 );
         }
         //~ prev_z = z;
         
@@ -4815,7 +4846,7 @@ menu_redraw_do()
         console_draw_from_menu();
         #endif
 
-        if (DOUBLE_BUFFERING)
+        if (DOUBLE_BUFFERING && !native_menu_frame)
         {
             // copy image to main buffer
             bmp_draw_to_idle(0);
@@ -4854,6 +4885,14 @@ menu_redraw_do()
             }
             //~ bmp_idle_clear();
         }
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+        if (native_menu_frame && menu_redraw_cancel)
+        {
+            menu_redraw_cancel = 0;
+            bmp_native_xcm_menu_frame_abort();
+            return;
+        }
+#endif
         //~ update_stuff();
         lens_display_set_dirty();
     }
@@ -4881,7 +4920,12 @@ menu_redraw_do()
     #ifdef CONFIG_VXWORKS   
     set_ml_palette();    
     #endif
-    ml_refresh_display_needed = 1;
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    if (native_menu_frame)
+        bmp_native_xcm_menu_frame_commit();
+    else
+#endif
+        ml_refresh_display_needed = 1;
 }
 
 void menu_benchmark()
@@ -5627,11 +5671,23 @@ static void piggyback_canon_menu()
     if (sensor_cleaning) return;
     if (gui_state == GUISTATE_MENUDISP) return;
     NotifyBoxHide();
-    if (new_gui_mode != (int)CURRENT_GUI_MODE) 
-    { 
-        start_redraw_flood();
-        if (lv) bmp_off(); // mask out the underlying Canon menu :)
-        SetGUIRequestMode(new_gui_mode); msleep(200); 
+    if (new_gui_mode != (int)CURRENT_GUI_MODE)
+    {
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+        if (!menu_native_xcm_active())
+#endif
+        {
+            start_redraw_flood();
+            if (lv) bmp_off(); // mask out the underlying Canon menu :)
+        }
+
+        SetGUIRequestMode(new_gui_mode);
+        msleep(200);
+
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+        if (menu_native_xcm_active())
+            bmp_native_xcm_menu_sync_present();
+#endif
         // bmp will be enabled after first redraw
     }
 #endif
@@ -5643,9 +5699,16 @@ static void close_canon_menu()
     if (CURRENT_GUI_MODE == 0) return;
     if (sensor_cleaning) return;
     if (gui_state == GUISTATE_MENUDISP) return;
-    if (lv) bmp_off(); // mask out the underlying Canon menu :)
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    if (!menu_native_xcm_active())
+#endif
+        if (lv) bmp_off(); // mask out the underlying Canon menu :)
     SetGUIRequestMode(0);
     msleep(100);
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    if (menu_native_xcm_active())
+        bmp_native_xcm_menu_sync_present();
+#endif
     // bitmap will be re-enabled in the caller
 #endif
 #ifdef CONFIG_5DC
@@ -5691,7 +5754,18 @@ static void menu_open()
     if (lv)
         menu_zebras_mirror_dirty = 1;
 
-    piggyback_canon_menu();
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    if (menu_native_xcm_active())
+    {
+        bmp_native_xcm_menu_enter();
+        menu_redraw_do();
+        piggyback_canon_menu();
+    }
+    else
+#endif
+    {
+        piggyback_canon_menu();
+    }
     canon_gui_disable_front_buffer(0);
     if (lv && EXT_MONITOR_CONNECTED)
         clrscr();
@@ -5699,14 +5773,20 @@ static void menu_open()
 #if !defined(CONFIG_XF605)
     CancelDateTimer();
 #endif
-    menu_redraw_full();
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    if (!menu_native_xcm_active())
+#endif
+        menu_redraw_full();
 }
 
 static void menu_close() 
 { 
     if (!menu_shown)
         return;
-    menu_shown = false;
+
+    int native_menu_close = menu_native_xcm_active();
+    if (!native_menu_close)
+        menu_shown = false;
 
     customize_mode = 0;
     update_disp_mode_bits_from_params();
@@ -5715,14 +5795,17 @@ static void menu_close()
     menu_lv_transparent_mode = 0;
     
     close_canon_menu();
+    if (native_menu_close)
+        menu_shown = false;
     canon_gui_enable_front_buffer(0);
 
     #ifdef FEATURE_VRAM_RGBA
-    // we need to blank the indexed RGB buffer with transparent black,
-    // to remove ML menus.  Otherwise, floating elements that we want
-    // to display over Canon GUI will trigger redraw, and we'll display
-    // ML menu elements too.
-    clrscr();
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    if (native_menu_close)
+        rgba_menu_close_clear_and_present();
+    else
+#endif
+        clrscr();
     #endif
 
     redraw();
