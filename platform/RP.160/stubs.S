@@ -204,7 +204,9 @@ THUMB_FN(0xe03c9888, _get_task_info_by_id) // function before " CORE : %d\n" str
  * pointer to layer 0, which is more reliable.
  */
 THUMB_FN(0xe010efa4, XCM_GetSourceSurface)          // by debug message
-//THUMB_FN(0xe010ed6c, XCM_MakeContext)             // by debug message. Not used in code, left for reference below.
+THUMB_FN(0xe010ed6c, XCM_MakeContext)              // by debug message
+THUMB_FN(0xe010f01e, XCM_SetLayerOffset)           // by debug message
+THUMB_FN(0xe010f32c, XCM_SetLUT)                   // by debug message
 DATA_PTR(    0xFF78, _pXCM);                        // param1 to XCM_MakeContext() when called from refreshVrmsSurface()
 
 /**
