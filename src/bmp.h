@@ -37,6 +37,11 @@ extern int bmp_enabled;
 
 extern uint32_t ml_refresh_display_needed;
 
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+/* Runtime selector: 0 keeps the established indexed-to-RGBA renderer. */
+extern int ml_indexed_renderer_mode;
+#endif
+
 /** Returns a pointer to the real BMP vram (or to idle BMP vram) */
 uint8_t * bmp_vram(void);
 
@@ -75,6 +80,20 @@ inline uint8_t *rgb_vram_preinit()
 }
 
 void refresh_yuv_from_rgb(void);
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+void refresh_yuv_from_rgb_serialized(void);
+void rgba_menu_close_clear_and_present(void);
+void bmp_native_xcm_menu_enter(void);
+int bmp_native_xcm_menu_sync_present(void);
+int bmp_native_xcm_menu_frame_begin(void);
+int bmp_native_xcm_menu_frame_commit(void);
+void bmp_native_xcm_menu_frame_abort(void);
+int bmp_native_xcm_overlay_frame_begin(int clear_surface);
+int bmp_native_xcm_overlay_frame_commit(void);
+void bmp_native_xcm_overlay_frame_abort(void);
+int bmp_native_xcm_overlay_frame_is_active(void);
+void bmp_native_xcm_notify_gui_state_change(void);
+#endif
 void refresh_yuv_from_rgb_task(void *);
 uint32_t indexed2rgb(uint8_t color);
 

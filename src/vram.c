@@ -757,6 +757,9 @@ PROP_HANDLER(PROP_LV_ACTION)
 PROP_HANDLER(PROP_GUI_STATE)
 {
     vram_params_set_dirty();
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    bmp_native_xcm_notify_gui_state_change();
+#endif
 }
 
 PROP_HANDLER(PROP_VIDEO_MODE)

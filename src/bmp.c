@@ -31,6 +31,10 @@
 #include <stdarg.h>
 #include "propvalues.h"
 #include "zebra.h"
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+#include "menu.h"
+#include "mmu_utils.h"
+#endif
 
 //~ int bmp_enabled = 1;
 
@@ -108,7 +112,221 @@ void bmp_draw_to_idle(int value) { bmp_idle_flag = value; }
 
 #ifdef FEATURE_VRAM_RGBA
 struct MARV *rgb_vram_info = NULL;
+extern struct semaphore *winsys_sem;
 static uint8_t *bmp_vram_indexed = NULL;
+
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+static uint8_t *bmp_vram_indexed_back = NULL;
+static uint8_t *bmp_vram_overlay = NULL;
+static uint8_t *bmp_vram_overlay_back = NULL;
+static struct semaphore *bmp_vram_switch_sem = NULL;
+
+#define BMP_NATIVE_FRAME_NONE    (-1)
+#define BMP_NATIVE_FRAME_MENU      COMPOSITOR_NATIVE_LAYER_MENU
+#define BMP_NATIVE_FRAME_OVERLAY   COMPOSITOR_NATIVE_LAYER_OVERLAY
+
+static volatile int native_menu_surface_valid = 0;
+static volatile int native_overlay_surface_valid = 0;
+static volatile int native_overlay_invalidate_pending = 0;
+static volatile int native_frame_build_role = BMP_NATIVE_FRAME_NONE;
+static int native_frame_locks_held = 0;
+
+int ml_indexed_renderer_mode = 0;
+
+static int bmp_native_buffers_ready(void)
+{
+    return bmp_vram_indexed && bmp_vram_indexed_back &&
+           bmp_vram_overlay && bmp_vram_overlay_back &&
+           bmp_vram_switch_sem;
+}
+
+static uint8_t *bmp_indexed_front_current(void)
+{
+    if (ml_indexed_renderer_mode && !gui_menu_shown() && bmp_vram_overlay)
+        return bmp_vram_overlay;
+    return bmp_vram_indexed;
+}
+
+static uint8_t *bmp_indexed_back_current(void)
+{
+    if (ml_indexed_renderer_mode && !gui_menu_shown() &&
+        bmp_vram_overlay_back)
+        return bmp_vram_overlay_back;
+    return bmp_vram_indexed_back;
+}
+
+static void bmp_native_mark_current_surface_valid(void)
+{
+    if (!ml_indexed_renderer_mode || native_frame_build_role >= 0)
+        return;
+
+    if (gui_menu_shown())
+        native_menu_surface_valid = 1;
+    else
+        native_overlay_surface_valid = 1;
+}
+
+void bmp_native_xcm_notify_gui_state_change(void)
+{
+    if (!ml_indexed_renderer_mode)
+        return;
+
+    native_overlay_surface_valid = 0;
+    native_overlay_invalidate_pending = 1;
+    ml_refresh_display_needed = 1;
+}
+
+static int bmp_native_overlay_context_allowed(void)
+{
+    if (gui_menu_shown())
+        return 0;
+
+    if (CURRENT_GUI_MODE == 0 || PLAY_MODE)
+        return 1;
+
+    return 0;
+}
+
+static void bmp_native_clear_overlay_buffers_locked(void)
+{
+    if (bmp_vram_overlay)
+        bzero32(bmp_vram_overlay, BMP_VRAM_SIZE);
+    if (bmp_vram_overlay_back)
+        bzero32(bmp_vram_overlay_back, BMP_VRAM_SIZE);
+
+    native_overlay_surface_valid = 0;
+    native_overlay_invalidate_pending = 0;
+}
+
+static void bmp_native_prepare_overlay_access(void)
+{
+    if (!ml_indexed_renderer_mode || gui_menu_shown() ||
+        !native_overlay_invalidate_pending)
+        return;
+
+    refresh_yuv_from_rgb_serialized();
+}
+
+void bmp_native_xcm_menu_enter(void)
+{
+    if (!ml_indexed_renderer_mode)
+        return;
+
+    take_semaphore(bmp_vram_switch_sem, 0);
+
+    bzero32(bmp_vram_indexed, BMP_VRAM_SIZE);
+    bzero32(bmp_vram_indexed_back, BMP_VRAM_SIZE);
+    native_menu_surface_valid = 0;
+    native_overlay_surface_valid = 0;
+    native_overlay_invalidate_pending = 1;
+
+    take_semaphore(winsys_sem, 0);
+    compositor_native_indexed_menu_enter();
+    compositor_native_indexed_hide_all();
+    give_semaphore(winsys_sem);
+
+    give_semaphore(bmp_vram_switch_sem);
+}
+
+static int bmp_native_xcm_frame_begin(int role, int clear_surface)
+{
+    if (!ml_indexed_renderer_mode || !bmp_native_buffers_ready())
+        return 0;
+
+    if (role == BMP_NATIVE_FRAME_MENU)
+    {
+        if (!gui_menu_shown())
+            return 0;
+    }
+    else if (role == BMP_NATIVE_FRAME_OVERLAY)
+    {
+        if (gui_menu_shown() || !bmp_native_overlay_context_allowed())
+            return 0;
+
+        bmp_native_prepare_overlay_access();
+        if (native_overlay_invalidate_pending)
+            return 0;
+    }
+    else
+    {
+        return 0;
+    }
+
+    AcquireRecursiveLock(bmp_lock, 0);
+    take_semaphore(bmp_vram_switch_sem, 0);
+
+    if (native_frame_build_role >= 0 ||
+        (role == BMP_NATIVE_FRAME_OVERLAY &&
+         native_overlay_invalidate_pending))
+    {
+        int busy_role = native_frame_build_role;
+        give_semaphore(bmp_vram_switch_sem);
+        ReleaseRecursiveLock(bmp_lock);
+        DryosDebugMsg(0, 15,
+            "Native XCM frame begin reject r=%d b=%d", role, busy_role);
+        return 0;
+    }
+
+    native_frame_locks_held = 1;
+    native_frame_build_role = role;
+    bmp_idle_flag = 1;
+
+    uint8_t *front = role == BMP_NATIVE_FRAME_MENU ?
+        bmp_vram_indexed : bmp_vram_overlay;
+    uint8_t *back = role == BMP_NATIVE_FRAME_MENU ?
+        bmp_vram_indexed_back : bmp_vram_overlay_back;
+
+    if (clear_surface || role == BMP_NATIVE_FRAME_MENU)
+        bzero32(back, BMP_VRAM_SIZE);
+    else
+        memcpy(back, front, BMP_VRAM_SIZE);
+
+    return 1;
+}
+
+static void bmp_native_xcm_frame_abort(int role)
+{
+    if (native_frame_build_role != role)
+        return;
+
+    bmp_idle_flag = 0;
+    native_frame_build_role = BMP_NATIVE_FRAME_NONE;
+
+    if (native_frame_locks_held)
+    {
+        native_frame_locks_held = 0;
+        give_semaphore(bmp_vram_switch_sem);
+        ReleaseRecursiveLock(bmp_lock);
+    }
+}
+
+int bmp_native_xcm_menu_frame_begin(void)
+{
+    return bmp_native_xcm_frame_begin(BMP_NATIVE_FRAME_MENU, 1);
+}
+
+void bmp_native_xcm_menu_frame_abort(void)
+{
+    bmp_native_xcm_frame_abort(BMP_NATIVE_FRAME_MENU);
+}
+
+int bmp_native_xcm_overlay_frame_begin(int clear_surface)
+{
+    return bmp_native_xcm_frame_begin(
+        BMP_NATIVE_FRAME_OVERLAY, clear_surface ? 1 : 0);
+}
+
+void bmp_native_xcm_overlay_frame_abort(void)
+{
+    bmp_native_xcm_frame_abort(BMP_NATIVE_FRAME_OVERLAY);
+}
+
+int bmp_native_xcm_overlay_frame_is_active(void)
+{
+    return native_frame_build_role == BMP_NATIVE_FRAME_OVERLAY;
+}
+#endif
+
 // SJE what is an appropriate priority for this task?
 TASK_CREATE( "redraw_task", refresh_yuv_from_rgb_task, 0, 0x1e, 0x1000 );
 #endif
@@ -135,7 +353,18 @@ uint8_t * bmp_vram(void)
     // to dynamically determine the real offset without inspecting the pointer.
     //
     // For now, assume 720x480.
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    bmp_native_prepare_overlay_access();
+    uint8_t *front = bmp_indexed_front_current();
+    uint8_t *back = bmp_indexed_back_current();
+    uint8_t *indexed = (bmp_idle_flag && back) ? back : front;
+    if (ml_indexed_renderer_mode && !bmp_idle_flag &&
+        native_frame_build_role < 0)
+        bmp_native_mark_current_surface_valid();
+    uint8_t *bmp_buf = indexed + BMP_HDMI_OFFSET;
+#else
     uint8_t *bmp_buf = bmp_vram_indexed + BMP_HDMI_OFFSET;
+#endif
     // bmp_vram_indexed is initialised by bmp_init()
     #else
     uint8_t *bmp_buf = bmp_idle_flag ? bmp_vram_idle() : bmp_vram_real();
@@ -149,6 +378,34 @@ uint8_t * bmp_vram(void)
 // 1 = copy idle to BMP
 void bmp_idle_copy(int direction, int fullsize)
 {
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    if (ml_indexed_renderer_mode && bmp_vram_indexed_back &&
+        bmp_vram_switch_sem)
+    {
+        if (native_frame_build_role == BMP_NATIVE_FRAME_MENU)
+            return;
+
+        take_semaphore(bmp_vram_switch_sem, 0);
+        if (!gui_menu_shown() && bmp_vram_overlay &&
+            bmp_vram_overlay_back)
+        {
+            uint8_t *tmp = bmp_vram_overlay;
+            bmp_vram_overlay = bmp_vram_overlay_back;
+            bmp_vram_overlay_back = tmp;
+            native_overlay_surface_valid = 1;
+        }
+        else
+        {
+            uint8_t *tmp = bmp_vram_indexed;
+            bmp_vram_indexed = bmp_vram_indexed_back;
+            bmp_vram_indexed_back = tmp;
+            native_menu_surface_valid = 1;
+        }
+        give_semaphore(bmp_vram_switch_sem);
+        ml_refresh_display_needed = 1;
+        return;
+    }
+#endif
     uint8_t* real = bmp_vram_real();
     uint8_t* idle = bmp_vram_idle();
     ASSERT(real)
@@ -190,11 +447,110 @@ void bmp_idle_copy(int direction, int fullsize)
 // has been updated.  Should probably take a XimrContext *,
 // but this struct is not yet determined for 200D
 extern int XimrExe(void *);
-extern struct semaphore *winsys_sem;
+
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+static int bmp_native_present_surface_locked(int role, uint8_t *src)
+{
+    if (!src)
+        return 1;
+
+    dcache_clean((uint32_t)src, BMP_VRAM_SIZE);
+
+    take_semaphore(winsys_sem, 0);
+    int rc = compositor_native_indexed_prepare(role, src);
+    if (rc == 0)
+        XimrExe((void *)XIMR_CONTEXT);
+    give_semaphore(winsys_sem);
+
+    return rc == 0 ? 0 : 100 + rc;
+}
+
+int bmp_native_xcm_menu_sync_present(void)
+{
+    if (!ml_indexed_renderer_mode || !bmp_native_buffers_ready())
+        return 1;
+
+    take_semaphore(bmp_vram_switch_sem, 0);
+    int rc = bmp_native_present_surface_locked(
+        BMP_NATIVE_FRAME_MENU, bmp_vram_indexed);
+    give_semaphore(bmp_vram_switch_sem);
+
+    if (rc != 0)
+        DryosDebugMsg(0, 15, "Native XCM menu sync rc=%d", rc);
+    return rc;
+}
+
+static int bmp_native_xcm_frame_commit(int role)
+{
+    if (native_frame_build_role != role || !native_frame_locks_held)
+        return 1;
+
+    uint8_t **front_ptr = role == BMP_NATIVE_FRAME_MENU ?
+        &bmp_vram_indexed : &bmp_vram_overlay;
+    uint8_t **back_ptr = role == BMP_NATIVE_FRAME_MENU ?
+        &bmp_vram_indexed_back : &bmp_vram_overlay_back;
+    uint8_t *new_front = *back_ptr;
+
+    int rc = bmp_native_present_surface_locked(role, new_front);
+
+    if (rc == 0)
+    {
+        uint8_t *old_front = *front_ptr;
+        *front_ptr = new_front;
+        *back_ptr = old_front;
+
+        if (role == BMP_NATIVE_FRAME_MENU)
+            native_menu_surface_valid = 1;
+        else
+        {
+            native_overlay_surface_valid = 1;
+            native_overlay_invalidate_pending = 0;
+        }
+    }
+    else
+    {
+        if (bmp_vram_indexed && new_front &&
+            bmp_vram_indexed != new_front)
+            memcpy(bmp_vram_indexed, new_front, BMP_VRAM_SIZE);
+
+        take_semaphore(winsys_sem, 0);
+        compositor_native_indexed_disable();
+        give_semaphore(winsys_sem);
+        ml_indexed_renderer_mode = 0;
+        DryosDebugMsg(0, 15, "Native XCM commit fallback r=%d rc=%d",
+                      role, rc);
+    }
+
+    bmp_idle_flag = 0;
+    native_frame_build_role = BMP_NATIVE_FRAME_NONE;
+    native_frame_locks_held = 0;
+    give_semaphore(bmp_vram_switch_sem);
+    ReleaseRecursiveLock(bmp_lock);
+
+    if (rc != 0)
+        ml_refresh_display_needed = 1;
+    return rc;
+}
+
+int bmp_native_xcm_menu_frame_commit(void)
+{
+    return bmp_native_xcm_frame_commit(BMP_NATIVE_FRAME_MENU);
+}
+
+int bmp_native_xcm_overlay_frame_commit(void)
+{
+    return bmp_native_xcm_frame_commit(BMP_NATIVE_FRAME_OVERLAY);
+}
+#endif
+
 void refresh_yuv_from_rgb(void)
 {
-    // get our indexed buffer, convert into our real rgb buffer
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    int native_clear_overlay_after_present = 0;
+    uint8_t *b = bmp_indexed_front_current();
+#else
     uint8_t *b = bmp_vram_indexed;
+#endif
     uint32_t *rgb_data = NULL;
 
     if (rgb_vram_info != NULL)
@@ -206,6 +562,74 @@ void refresh_yuv_from_rgb(void)
         DryosDebugMsg(0, 15, "rgb_vram_info was NULL, can't refresh OSD");
         return;
     }
+
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    if (!ml_indexed_renderer_mode && compositor_native_indexed_is_active())
+    {
+        take_semaphore(winsys_sem, 0);
+        compositor_native_indexed_disable();
+        give_semaphore(winsys_sem);
+    }
+
+    if (ml_indexed_renderer_mode && !bmp_native_buffers_ready())
+    {
+        take_semaphore(winsys_sem, 0);
+        compositor_native_indexed_disable();
+        give_semaphore(winsys_sem);
+        ml_indexed_renderer_mode = 0;
+        b = bmp_vram_indexed;
+        DryosDebugMsg(0, 15, "Native XCM buffers unavailable");
+    }
+
+    if (ml_indexed_renderer_mode)
+    {
+        int role = gui_menu_shown() ?
+            BMP_NATIVE_FRAME_MENU : BMP_NATIVE_FRAME_OVERLAY;
+        int surface_valid = role == BMP_NATIVE_FRAME_MENU ?
+            native_menu_surface_valid : native_overlay_surface_valid;
+        int context_allowed = role == BMP_NATIVE_FRAME_MENU ?
+            1 : bmp_native_overlay_context_allowed();
+        int rc = 0;
+
+        if (role == BMP_NATIVE_FRAME_OVERLAY &&
+            native_overlay_invalidate_pending)
+        {
+            surface_valid = 0;
+            native_clear_overlay_after_present = 1;
+        }
+
+        if (!surface_valid || !context_allowed)
+        {
+            take_semaphore(winsys_sem, 0);
+            rc = compositor_native_indexed_hide_all();
+            if (rc == 0)
+                XimrExe((void *)XIMR_CONTEXT);
+            give_semaphore(winsys_sem);
+        }
+        else
+        {
+            rc = bmp_native_present_surface_locked(role, b);
+        }
+
+        if (rc == 0)
+        {
+            if (native_clear_overlay_after_present)
+                bmp_native_clear_overlay_buffers_locked();
+            ml_refresh_display_needed = 0;
+            return;
+        }
+
+        if (b != bmp_vram_indexed)
+            memcpy(bmp_vram_indexed, b, BMP_VRAM_SIZE);
+
+        take_semaphore(winsys_sem, 0);
+        compositor_native_indexed_disable();
+        give_semaphore(winsys_sem);
+        ml_indexed_renderer_mode = 0;
+        b = bmp_vram_indexed;
+        DryosDebugMsg(0, 15, "Native XCM fallback rc=%d", rc);
+    }
+#endif
 
 #if !defined(CONFIG_INSTALLER)
     if(zebra_should_run()){
@@ -269,6 +693,60 @@ void refresh_yuv_from_rgb(void)
     ml_refresh_display_needed = 0;
 }
 
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+void refresh_yuv_from_rgb_serialized(void)
+{
+    int overlay_lock = 0;
+
+    if (ml_indexed_renderer_mode && !gui_menu_shown() &&
+        native_frame_build_role < 0)
+    {
+        AcquireRecursiveLock(bmp_lock, 0);
+        overlay_lock = 1;
+    }
+
+    take_semaphore(bmp_vram_switch_sem, 0);
+    refresh_yuv_from_rgb();
+    give_semaphore(bmp_vram_switch_sem);
+
+    if (overlay_lock)
+        ReleaseRecursiveLock(bmp_lock);
+}
+
+void rgba_menu_close_clear_and_present(void)
+{
+    if (!ml_indexed_renderer_mode || !bmp_native_buffers_ready())
+        return;
+
+    take_semaphore(bmp_vram_switch_sem, 0);
+    take_semaphore(winsys_sem, 0);
+
+    compositor_native_indexed_menu_exit();
+    int rc = compositor_native_indexed_hide_all();
+    if (rc == 0)
+        XimrExe((void *)XIMR_CONTEXT);
+
+    give_semaphore(winsys_sem);
+
+    if (rc != 0)
+    {
+        take_semaphore(winsys_sem, 0);
+        compositor_native_indexed_disable();
+        give_semaphore(winsys_sem);
+        ml_indexed_renderer_mode = 0;
+        DryosDebugMsg(0, 15, "Native XCM menu close fallback rc=%d", rc);
+    }
+
+    bzero32(bmp_vram_indexed, BMP_VRAM_SIZE);
+    bzero32(bmp_vram_indexed_back, BMP_VRAM_SIZE);
+    bmp_native_clear_overlay_buffers_locked();
+    native_menu_surface_valid = 0;
+    rgba_buffer_clear();
+
+    give_semaphore(bmp_vram_switch_sem);
+}
+#endif
+
 void rgba_buffer_clear()
 {
     if (rgb_vram_info == NULL) return;
@@ -293,9 +771,16 @@ void refresh_yuv_from_rgb_task(void *unused)
     {
         if (ml_refresh_display_needed && !ml_shutdown_requested && DISPLAY_IS_ON)
         {
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+            ml_refresh_display_needed = 0;
+            refresh_yuv_from_rgb_serialized();
+            if (ml_indexed_renderer_mode)
+                continue;
+#else
             refresh_yuv_from_rgb();
+#endif
         }
-        msleep(50); // max 20 fps refresh
+        msleep(50); // max 20 fps refresh for the established renderer
     }
 }
 
@@ -1477,6 +1962,37 @@ static void bmp_init(void* unused)
     ASSERT(bmp_lock)
     bvram_mirror_init();
 #ifdef FEATURE_VRAM_RGBA
+#ifdef CONFIG_COMPOSITOR_XCM_NATIVE_INDEXED
+    bmp_vram_indexed = malloc(BMP_VRAM_SIZE + 0x100);
+    bmp_vram_indexed_back = malloc(BMP_VRAM_SIZE + 0x100);
+    bmp_vram_overlay = malloc(BMP_VRAM_SIZE + 0x100);
+    bmp_vram_overlay_back = malloc(BMP_VRAM_SIZE + 0x100);
+    bmp_vram_switch_sem = create_named_semaphore(
+        "bmp_vram", SEM_CREATE_UNLOCKED);
+
+    if (bmp_vram_indexed)
+        bmp_vram_indexed = (uint8_t *)(
+            ((uintptr_t)bmp_vram_indexed + 0xffu) & ~(uintptr_t)0xffu);
+    if (bmp_vram_indexed_back)
+        bmp_vram_indexed_back = (uint8_t *)(
+            ((uintptr_t)bmp_vram_indexed_back + 0xffu) & ~(uintptr_t)0xffu);
+    if (bmp_vram_overlay)
+        bmp_vram_overlay = (uint8_t *)(
+            ((uintptr_t)bmp_vram_overlay + 0xffu) & ~(uintptr_t)0xffu);
+    if (bmp_vram_overlay_back)
+        bmp_vram_overlay_back = (uint8_t *)(
+            ((uintptr_t)bmp_vram_overlay_back + 0xffu) & ~(uintptr_t)0xffu);
+
+    if (bmp_native_buffers_ready())
+    {
+        memset(bmp_vram_indexed, COLOR_TRANSPARENT_BLACK, BMP_VRAM_SIZE);
+        memset(bmp_vram_indexed_back, COLOR_TRANSPARENT_BLACK, BMP_VRAM_SIZE);
+        memset(bmp_vram_overlay, COLOR_TRANSPARENT_BLACK, BMP_VRAM_SIZE);
+        memset(bmp_vram_overlay_back, COLOR_TRANSPARENT_BLACK, BMP_VRAM_SIZE);
+    }
+    else
+        ASSERT(1);
+#else
     bmp_vram_indexed = malloc(BMP_VRAM_SIZE);
     // initialise to transparent, this allows us to draw over
     // existing screen, rather than replace it, due to checks
@@ -1485,6 +2001,7 @@ static void bmp_init(void* unused)
         memset(bmp_vram_indexed, COLOR_TRANSPARENT_BLACK, BMP_VRAM_SIZE);
     else
         ASSERT(1);
+#endif
 #endif
 
     _update_vram_params();
