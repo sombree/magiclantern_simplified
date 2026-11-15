@@ -2291,3 +2291,345 @@ out:
     RP_BACKEND_TRACE("REAL32 END rc=%d", rc);
     return rc;
 }
+
+
+/* Copy a CRX scatter/gather result into caller-owned contiguous-slot regions.
+ *
+ * This is the v1.13 output-detach transaction moved into raw_vidx.  Source
+ * addresses are Canon CRX DMA/bus addresses and are intentionally NOT CPU
+ * dereferenced.  The entire list shares one RP native resource/power lifecycle,
+ * while every linear block is capped at 0xF000 so D8 SetSize never truncates a
+ * geometry field. */
+int raw_vid_rp_m2m_crop_once(const void *src_frame, uint32_t src_pitch,
+                              uint32_t crop_x, uint32_t crop_y,
+                              uint32_t crop_w, uint32_t crop_h,
+                              void *dst, uint32_t dst_size,
+                              uint32_t *elapsed_us)
+{
+    return rp_m2m_crop_wire_once(src_frame, src_pitch, crop_x, crop_y,
+               crop_w, crop_h, dst, dst_size, elapsed_us, (uint32_t)BPP);
+}
+int raw_vid_rp_m2m_copy_sg(const uint32_t *src_addr, const uint32_t *src_size,
+                           void *const *dst_addr, uint32_t count,
+                           uint32_t *bytes_done, uint32_t *blocks_done,
+                           uint32_t *elapsed_us)
+{
+    typedef void *(*res_create_fn)(uint32_t *, uint32_t);
+    typedef void (*res_lock_fn)(void *);
+    typedef void (*res_unlock_fn)(void);
+    typedef void (*res_destroy_fn)(void *);
+    typedef void (*ch_fn)(uint32_t);
+    typedef void (*boomer_select_fn)(uint32_t, uint32_t);
+    typedef void (*register_cbr_fn)(int, void (*)(void *), void *);
+    struct rp_d8_edmac_info_sg
+    {
+        uint32_t off1s, off1a, off1b;
+        uint32_t off2s, off2a, off2b;
+        uint32_t off3;
+        uint32_t xs, xa, xb;
+        uint32_t ys, ya, yb;
+        uint32_t xn, yn;
+    };
+    /* C99 compile-time ABI guard.  Keep this as an enum rather than a local
+     * typedef: the module build uses -Werror and GCC diagnoses unused local
+     * typedefs (-Wunused-local-typedefs). */
+    enum {
+        rp_d8_edmac_info_sg_must_be_60_bytes =
+            1 / !!(sizeof(struct rp_d8_edmac_info_sg) == 60u)
+    };
+    typedef void (*set_addr_fn)(uint32_t, void *);
+    typedef void (*set_size_fn)(uint32_t, struct rp_d8_edmac_info_sg *);
+    typedef void (*set_mode_fn)(uint32_t, uint32_t);
+
+    static uint32_t resources[2] = { 0x000100ADu, 0x000100BBu };
+    const uint32_t linear_max = 0x0000F000u;
+    const uint32_t spin_before_sleep_us = 250u;
+
+    if (!is_camera("RP", "1.6.0") || !src_addr || !src_size || !dst_addr)
+        return -300;
+    if (count == 0u || count > 64u)
+        return -301;
+
+    if (bytes_done) *bytes_done = 0;
+    if (blocks_done) *blocks_done = 0;
+    if (elapsed_us) *elapsed_us = 0;
+
+    res_create_fn res_create = RP_THUMB_FN(RP_FN_RES_CREATE, res_create_fn);
+    res_lock_fn res_lock = RP_THUMB_FN(RP_FN_RES_LOCK, res_lock_fn);
+    res_unlock_fn res_unlock = RP_THUMB_FN(RP_FN_RES_UNLOCK, res_unlock_fn);
+    res_destroy_fn res_destroy = RP_THUMB_FN(RP_FN_RES_DESTROY, res_destroy_fn);
+    ch_fn edmac_reset = RP_THUMB_FN(RP_FN_EDMAC_RESET, ch_fn);
+    ch_fn final_start_rd = RP_THUMB_FN(RP_FN_EDMAC_FINAL_START_RD, ch_fn);
+    register_cbr_fn reg_complete =
+        RP_THUMB_FN(RP_FN_EDMAC_REGISTER_COMPLETE, register_cbr_fn);
+    ch_fn unreg_complete =
+        RP_THUMB_FN(RP_FN_EDMAC_UNREGISTER_COMPLETE, ch_fn);
+    ch_fn boomer_reset = RP_THUMB_FN(RP_FN_BOOMER_RESET, ch_fn);
+    boomer_select_fn boomer_select =
+        RP_THUMB_FN(RP_FN_BOOMER_SELECT, boomer_select_fn);
+    ch_fn stop_boomer = RP_THUMB_FN(RP_FN_EDMAC_STOP_BOOMER, ch_fn);
+    ch_fn reset_pack = RP_THUMB_FN(RP_FN_EDMAC_RESET_PACK, ch_fn);
+    ch_fn edmac_arm = RP_THUMB_FN(RP_FN_EDMAC_ARM, ch_fn);
+    set_addr_fn set_address = RP_THUMB_FN(RP_FN_EDMAC_SET_ADDRESS, set_addr_fn);
+    set_size_fn set_size = RP_THUMB_FN(RP_FN_EDMAC_SET_SIZE, set_size_fn);
+    set_mode_fn set_mode = RP_THUMB_FN(RP_FN_EDMAC_SET_MODE, set_mode_fn);
+
+    void *lock = NULL;
+    int locked = 0;
+    int cbrs = 0;
+    int boomer = 0;
+    int rc = -302;
+    uint32_t bytes = 0;
+    uint32_t blocks = 0;
+    uint32_t t_all = get_us_clock();
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+        if (!src_addr[i] || !src_size[i] || !dst_addr[i])
+            return -303;
+        if (src_size[i] & 1u)
+            return -304;
+        if (((uintptr_t)dst_addr[i] & (RP_M2M_ALIGN - 1u)) != 0u)
+            return -305;
+    }
+
+    lock = res_create(resources, 2u);
+    if (!lock)
+    {
+        rc = -306;
+        goto out;
+    }
+    res_lock(lock);
+    locked = 1;
+
+    edmac_reset(RP_M2M_WR_CH);
+    edmac_reset(RP_M2M_RD_CH);
+    boomer_reset(RP_M2M_WR_CH);
+    boomer_select(RP_M2M_WR_CH, RP_M2M_BOOMER_SELECTOR);
+    boomer = 1;
+
+    reg_complete((int)RP_M2M_WR_CH, rp_m2m_complete_cbr, (void *)2u);
+    reg_complete((int)RP_M2M_RD_CH, rp_m2m_complete_cbr, (void *)1u);
+    cbrs = 1;
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+        uint32_t done = 0;
+        while (done < src_size[i])
+        {
+            uint32_t left = src_size[i] - done;
+            uint32_t block = MIN(left, linear_max);
+            struct rp_d8_edmac_info_sg src_info = {0};
+            struct rp_d8_edmac_info_sg dst_info = {0};
+
+            if (block == 0u || (block & 1u))
+            {
+                rc = -307;
+                goto out;
+            }
+
+            src_info.xb = block;
+            dst_info.xb = block;
+
+            rp_m2m_rd_done = 0;
+            rp_m2m_wr_done = 0;
+            rp_dmb();
+
+            reset_pack(RP_M2M_WR_CH);
+            reset_pack(RP_M2M_RD_CH);
+            set_address(RP_M2M_WR_CH, (uint8_t *)dst_addr[i] + done);
+            set_address(RP_M2M_RD_CH,
+                        (void *)(uintptr_t)(src_addr[i] + done));
+            set_size(RP_M2M_WR_CH, &dst_info);
+            set_size(RP_M2M_RD_CH, &src_info);
+            set_mode(RP_M2M_WR_CH, 0u);
+            set_mode(RP_M2M_RD_CH, 0u);
+            rp_dmb();
+
+            uint32_t t0 = get_us_clock();
+            edmac_arm(RP_M2M_WR_CH);
+            edmac_arm(RP_M2M_RD_CH);
+            final_start_rd(RP_M2M_RD_CH);
+
+            while (!(rp_m2m_rd_done && rp_m2m_wr_done))
+            {
+                uint32_t dt = (uint32_t)(get_us_clock() - t0);
+                if (dt >= RP_M2M_TIMEOUT_US)
+                    break;
+                rp_dmb();
+                if (dt >= spin_before_sleep_us)
+                    msleep(1);
+            }
+
+            if (!(rp_m2m_rd_done && rp_m2m_wr_done))
+            {
+                rc = -308;
+                goto out;
+            }
+
+            done += block;
+            bytes += block;
+            blocks++;
+        }
+    }
+
+    rc = 0;
+
+out:
+    if (cbrs)
+    {
+        unreg_complete(RP_M2M_WR_CH);
+        unreg_complete(RP_M2M_RD_CH);
+    }
+    if (boomer)
+        stop_boomer(RP_M2M_WR_CH);
+
+    /*
+     * v7: one-shot R46/W13 transfers must leave hardware idle even after
+     * success.  The old path reset channels only on failure, allowing the
+     * completed configuration to persist into the next operation/session.
+     */
+    edmac_reset(RP_M2M_WR_CH);
+    edmac_reset(RP_M2M_RD_CH);
+    rp_dmb();
+
+    if (locked)
+        res_unlock();
+    if (lock)
+        res_destroy(lock);
+
+    if (bytes_done) *bytes_done = bytes;
+    if (blocks_done) *blocks_done = blocks;
+    if (elapsed_us) *elapsed_us = (uint32_t)(get_us_clock() - t_all);
+
+    RP_BACKEND_TRACE("CRX SG rc=%d seg=%d blocks=%d bytes=%d us=%d",
+                     rc, (int)count, (int)blocks, (int)bytes,
+                     elapsed_us ? (int)*elapsed_us : 0);
+    return rc;
+}
+
+int raw_vid_rp_init(struct msg_queue *event_q)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return -100;
+    if (!event_q)
+        return -101;
+
+    if (rp_backend_initialized)
+    {
+        if (rp_event_q != event_q)
+            return -102;
+        return 0;
+    }
+
+    rp_event_q = event_q;
+
+    /* Bind generic RAW-LV metadata discovery to the runtime-proven EOS RP
+     * channel-3 pBlock.  On DIGIC 8 raw.c intentionally starts with a NULL
+     * pBlock and requires the platform/backend to supply a validated address. */
+    raw_lv_set_edmac_channel_addr(RP_RAW_PBLOCK);
+    if (raw_lv_get_edmac_channel_addr() != RP_RAW_PBLOCK)
+        return -104;
+
+    if (!rp_post_sem)
+        rp_post_sem = create_named_semaphore("raw_rp_post", SEM_CREATE_UNLOCKED);
+    if (!rp_post_sem)
+        return -103;
+
+    /* Poll READY state from normal task context.  The hardware Complete ISR
+     * deliberately performs no DryOS service calls. */
+    if (!rp_ready_task_started)
+    {
+        task_create("raw_rp_ready", WORKER_PRIO, 0x1000, raw_vid_rp_ready_task, NULL);
+        rp_ready_task_started = 1;
+    }
+
+    /* v23: normal REC is RAM-only.  Do not patch E00DDF7C or E057C364.
+     * A persistent steering task watches the proven provider/Evf/Mem1/W3
+     * latch chain; the only hot entry point installed per session is Canon's
+     * existing ch3 Complete callback slot. */
+    if (!rp_steer_task_started)
+    {
+        task_create("raw_rp_steer", WORKER_PRIO, 0x1000,
+                    raw_vid_rp_steer_task, NULL);
+        rp_steer_task_started = 1;
+    }
+
+    rp_backend_initialized = 1;
+    rp_dmb();
+    RP_BACKEND_TRACE("INIT RAM-only MNAV backend PASS owner_hook=0 setsize_hook=0");
+    return 0;
+}
+
+
+static int rp_probe_alloc_capture_buffers(int count)
+{
+    rp_free_capture_buffers();
+    /* These older diagnostic probes do not use the matrix guard allocation. */
+    memset(&rp_guard, 0, sizeof(rp_guard));
+
+    if (count < 1 || count > RP_CAPTURE_BUFS)
+        return -40;
+
+    uint32_t alloc_size = raw_info.frame_size + RP_CAPTURE_ALLOC_PAD;
+
+    for (int i = 0; i < count; i++)
+    {
+        RP_BACKEND_TRACE("alloc[%d] before size=%d", i, (int)alloc_size);
+        void *p = fio_malloc(alloc_size);
+        RP_BACKEND_TRACE("alloc[%d] after ptr=%x", i, (uint32_t)(uintptr_t)p);
+
+        if (!p)
+        {
+            rp_free_capture_buffers();
+            return -41 - i;
+        }
+
+        rp_bufs[i].alloc = p;
+        rp_bufs[i].dma = rp_align_dma_buffer(p);
+        rp_bufs[i].state = RPBUF_FREE;
+        rp_buf_count = i + 1;
+
+        RP_BACKEND_TRACE("alloc[%d] dma=%x", i, rp_bufs[i].dma);
+    }
+
+    return 0;
+}
+
+/* RAM-only diagnostics: allocate-only stages 6..8 and the Canon ch3
+ * Complete callback-table observer in stage 10.  Historical ROM-hook stages
+ * 9 and 11..13 have been removed, not silently mapped to normal REC. */
+int raw_vid_rp_probe_start(uint32_t crop_w, uint32_t crop_h, int stage)
+{
+    if (!is_camera("RP", "1.6.0")) return -100;
+    if (!rp_backend_initialized || !rp_event_q || !rp_post_sem) return -2;
+    if (!rp_geometry_supported() || !rp_crop_supported(crop_w, crop_h)) return -3;
+    if ((stage < 6 || stage > 8) && stage != 10) return -90;
+
+    rp_reset_runtime_state();
+    rp_crop_w = crop_w;
+    rp_crop_h = crop_h;
+
+    if (stage >= 6 && stage <= 8)
+    {
+        int count = stage - 5;
+        int rc = rp_probe_alloc_capture_buffers(count);
+        RP_BACKEND_TRACE("S%d capture alloc rc=%d count=%d",
+                         stage, rc, rp_buf_count);
+        rp_free_capture_buffers();
+        return rc;
+    }
+
+    rp_complete_seq = 0;
+    RP_BACKEND_TRACE("S10 Complete tap install begin slot=%x arg=%x",
+                     rp_complete_slot_read(), rp_complete_arg_read());
+    int rc = rp_install_complete_tap();
+    if (rc) return rc;
+
+    msleep(250);
+    uint32_t completes = rp_complete_seq;
+    int restore_rc = rp_restore_complete_tap();
+    RP_BACKEND_TRACE("S10 Complete count=%d restore_rc=%d",
+                     (int)completes, restore_rc);
+    return restore_rc;
+}
