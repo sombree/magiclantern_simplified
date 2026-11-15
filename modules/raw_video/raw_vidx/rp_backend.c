@@ -656,3 +656,322 @@ static inline uint32_t rp_complete_slot_read(void)
 {
     return *(volatile uint32_t *)RP_COMPLETE_SLOT;
 }
+
+static inline uint32_t rp_complete_arg_read(void)
+{
+    return *(volatile uint32_t *)RP_COMPLETE_ARG_SLOT;
+}
+
+static void rp_reset_runtime_state(void)
+{
+    rp_capture_active = 0;
+    rp_stop_requested = 0;
+    rp_handback_done = 0;
+    rp_final_complete_seen = 0;
+    rp_ownership_uncertain = 0;
+    rp_current_slot = -1;
+
+    rp_owner_seq = 0;
+    rp_complete_seq = 0;
+    rp_ready_count = 0;
+    rp_queued_count = 0;
+    rp_released_count = 0;
+    rp_drop_no_free = 0;
+    rp_bad_complete = 0;
+    rp_post_fail = 0;
+    rp_fatal = 0;
+    rp_stop_task_scheduled = 0;
+    rp_overlap_count = 0;
+
+    rp_steer_active = 0;
+    rp_steer_expected_dma = 0;
+    rp_steer_expected_slot = -2;
+    rp_steer_current_slot = -1;
+    rp_steer_latch_count = 0;
+    rp_steer_canon_frames = 0;
+    rp_steer_no_free = 0;
+    rp_steer_desc_writes = 0;
+    rp_steer_last_latch_us = 0;
+    rp_complete_frame_size = 0;
+    rp_complete_last_cur = 0;
+    rp_complete_matched = 0;
+    rp_complete_unmatched = 0;
+}
+
+static void rp_free_capture_buffers(void)
+{
+    for (int i = 0; i < RP_CAPTURE_BUFS; i++)
+    {
+        if (rp_bufs[i].alloc)
+            fio_free(rp_bufs[i].alloc);
+
+        rp_bufs[i].alloc = NULL;
+        rp_bufs[i].dma = 0;
+        rp_bufs[i].state = RPBUF_FREE;
+        rp_bufs[i].owner_seq = 0;
+        rp_bufs[i].complete_seq = 0;
+    }
+    rp_buf_count = 0;
+    rp_capture_alloc_bytes = 0;
+    rp_capture_wire_payload_bytes = 0;
+    rp_capture_wire_pitch = 0;
+}
+
+static uint32_t rp_align_dma_buffer(void *alloc)
+{
+    uintptr_t p = (uintptr_t)alloc;
+    p = (p + RP_CAPTURE_ALIGN - 1u) & ~(uintptr_t)(RP_CAPTURE_ALIGN - 1u);
+    return (uint32_t)UNCACHEABLE((void *)p);
+}
+
+static int rp_alloc_capture_buffers(void)
+{
+    rp_free_capture_buffers();
+    memset(&rp_guard,0,sizeof(rp_guard));
+    uint32_t alloc_size=0;
+    if (rp_capture_allocation_size(&alloc_size)) return -1;
+    for (int i = 0; i < RP_CAPTURE_BUFS; i++)
+    {
+        void *p = fio_malloc(alloc_size);
+        if (!p)
+        {
+            rp_free_capture_buffers();
+            return -1;
+        }
+
+        rp_bufs[i].alloc = p;
+        rp_bufs[i].dma = rp_align_dma_buffer(p);
+        rp_bufs[i].state = RPBUF_FREE;
+        rp_buf_count = i + 1;
+        if (rp_guard_seed_slot(i))
+        {
+            RP_BACKEND_TRACE("W3GUARD seed failed slot=%d", i);
+            rp_free_capture_buffers();
+            return -2;
+        }
+    }
+    rp_capture_alloc_bytes = alloc_size * (uint32_t)rp_buf_count;
+    if (rp_guard.enabled)
+        RP_BACKEND_TRACE("W3GUARD nominal=%d full16=%d allocated_each=%d slots=%d",
+          (int)rp_guard.nominal,(int)rp_guard.nominal16,
+          (int)rp_guard.allocated_per_slot,rp_buf_count);
+    return 0;
+}
+
+static int rp_find_oldest_ready_buffer(void)
+{
+    int best = -1;
+    uint32_t best_seq = 0;
+
+    for (int i = 0; i < rp_buf_count; i++)
+    {
+        if (rp_bufs[i].state != RPBUF_READY)
+            continue;
+
+        uint32_t seq = rp_bufs[i].complete_seq;
+        if (best < 0 || (int32_t)(seq - best_seq) < 0)
+        {
+            best = i;
+            best_seq = seq;
+        }
+    }
+    return best;
+}
+
+static int rp_install_complete_tap(void)
+{
+    if (rp_tap_installed)
+        return 0;
+
+    rp_saved_complete_fn = rp_complete_slot_read();
+    rp_saved_complete_arg = rp_complete_arg_read();
+
+    if (rp_saved_complete_fn != RP_CANON_COMPLETE_NOP_THUMB ||
+        rp_saved_complete_arg != 0)
+        return -10;
+
+    rp_tap_ptr = (uint32_t)(uintptr_t)&raw_vid_rp_complete_tap;
+    if ((rp_tap_ptr & 1u) == 0)
+        return -12;
+
+    /* One aligned pointer store only.  Canon retains IRQ ownership and arg. */
+    *(volatile uint32_t *)RP_COMPLETE_SLOT = rp_tap_ptr;
+    rp_dmb();
+
+    if (rp_complete_slot_read() != rp_tap_ptr ||
+        rp_complete_arg_read() != rp_saved_complete_arg)
+    {
+        if (rp_complete_slot_read() == rp_tap_ptr)
+        {
+            *(volatile uint32_t *)RP_COMPLETE_SLOT = rp_saved_complete_fn;
+            rp_dmb();
+        }
+        return -11;
+    }
+
+    rp_tap_installed = 1;
+    return 0;
+}
+
+static int rp_restore_complete_tap(void)
+{
+    if (!rp_tap_installed)
+        return 0;
+
+    /* Never overwrite a slot Canon changed behind our back. */
+    if (rp_complete_slot_read() != rp_tap_ptr ||
+        rp_complete_arg_read() != rp_saved_complete_arg)
+        return -20;
+
+    *(volatile uint32_t *)RP_COMPLETE_SLOT = rp_saved_complete_fn;
+    rp_dmb();
+
+    if (rp_complete_slot_read() != rp_saved_complete_fn ||
+        rp_complete_arg_read() != rp_saved_complete_arg)
+        return -21;
+
+    rp_tap_installed = 0;
+    return 0;
+}
+
+static volatile uint32_t *rp_get_pack_cfg_field(uint32_t field_off)
+{
+    uint32_t state = *(volatile uint32_t *)(uintptr_t)RP_MEM1_STATE_PTR_LITERAL;
+
+    if ((state & 3u) || state < 0x1000u || state >= 0x40000000u)
+        return NULL;
+
+    return (volatile uint32_t *)(uintptr_t)
+        (state + RP_MEM1_PACK_CFG_OFF + field_off);
+}
+
+/*
+ * EOS RP fallback for generic raw_info discovery.
+ *
+ * v147/v148 runtime proof showed that generic raw_info may remain zero even
+ * while Mem1/W3 is fully active.  The firmware ABI itself is self-consistent:
+ *
+ *   W3+0x50 low16       = pitch bytes
+ *   W3+0x50 high16 + 1 = rows
+ *   width               = pitch * 8 / 14
+ *   W3+0xA0             = Canon Mem1 buffer
+ *   E0379B7E            = exact frame byte count
+ *
+ * Do not guess.  Publish raw_info only when every independent view agrees.
+ */
+int raw_vid_rp_sync_raw_info(void)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return -70;
+
+    uint32_t geom = *(volatile uint32_t *)(RP_RAW_PBLOCK + 0x50u);
+    uint32_t pitch = geom & 0xffffu;
+    uint32_t height = (geom >> 16) + 1u;
+    uint32_t pblock_buffer = *(volatile uint32_t *)(RP_RAW_PBLOCK + 0xA0u);
+    uint32_t canon_buffer = rp_raw_get_buffer();
+    uint32_t canon_size = rp_raw_get_size();
+
+    if (!pitch || !height || !pblock_buffer || !canon_buffer || !canon_size)
+        return -71;
+
+    uint64_t width_num = (uint64_t)pitch * 8u;
+    if (width_num % 14u)
+        return -72;
+
+    uint32_t width = (uint32_t)(width_num / 14u);
+    uint64_t frame64 = (uint64_t)pitch * (uint64_t)height;
+
+    if (!width || width > 8192u ||
+        !height || height > 8192u ||
+        frame64 == 0u || frame64 > 0xffffffffu)
+        return -73;
+
+    uint32_t frame_size = (uint32_t)frame64;
+
+    if (canon_buffer != pblock_buffer || canon_size != frame_size)
+        return -74;
+
+    raw_info.buffer = (void *)(uintptr_t)canon_buffer;
+    raw_info.width = (int)width;
+    raw_info.height = (int)height;
+    raw_info.pitch = (int)pitch;
+    raw_info.frame_size = (int)frame_size;
+    raw_info.bits_per_pixel = 14;
+
+    rp_dmb();
+
+    RP_BACKEND_TRACE("RAWINFO sync buf=%x wh=%d,%d pitch=%d size=%d geom=%x",
+                     canon_buffer, (int)width, (int)height,
+                     (int)pitch, (int)frame_size, geom);
+    return 0;
+}
+
+static volatile uint32_t *rp_get_pack_b3_field(void)
+{
+    return rp_get_pack_cfg_field(RP_MEM1_PACK_B3_OFF);
+}
+
+int raw_vid_rp_set_linear_packing(void)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return -80;
+    if (rp_linear_packing_active)
+        return 0;
+
+    if (raw_info.bits_per_pixel != 10 &&
+        raw_info.bits_per_pixel != 12 &&
+        raw_info.bits_per_pixel != 14)
+        return -81;
+
+    volatile uint32_t *field = rp_get_pack_b3_field();
+    if (!field)
+        return -82;
+
+    uint32_t old = *field;
+    if ((old & 0xffu) != 0u)
+        return -83;
+
+    uint32_t pu_before =
+        *(volatile uint32_t *)(RP_PU2_PBLOCK + RP_PU_MODE_OFF);
+
+    if (pu_before & RP_PU_BIT0)
+        return -84;
+
+    rp_pack_b3_field = field;
+    rp_pack_b3_saved = old;
+    rp_linear_baseline_pu2 = pu_before;
+
+    *field = (old & ~0xffu) | 1u;
+    rp_dmb();
+
+    uint32_t expected = pu_before | RP_PU_BIT0;
+    uint32_t seen = 0;
+    uint32_t t0 = get_us_clock();
+
+    while ((uint32_t)(get_us_clock() - t0) < 250000u)
+    {
+        seen = *(volatile uint32_t *)(RP_PU2_PBLOCK + RP_PU_MODE_OFF);
+        if (seen == expected && ((*field & 0xffu) == 1u))
+            break;
+        msleep(5);
+    }
+
+    if (seen != expected || ((*field & 0xffu) != 1u))
+    {
+        *field = old;
+        rp_dmb();
+        rp_pack_b3_field = NULL;
+        rp_pack_b3_saved = 0;
+        rp_linear_baseline_pu2 = 0;
+        RP_BACKEND_TRACE("LINEAR apply FAIL bpp=%d old=%x exp=%x seen=%x field=%x",
+                         raw_info.bits_per_pixel,
+                         old, expected, seen, (uint32_t)*field);
+        return -85;
+    }
+
+    rp_linear_packing_active = 1;
+    RP_BACKEND_TRACE("LINEAR apply PASS bpp=%d field=%x PU2=%x->%x",
+                     raw_info.bits_per_pixel,
+                     (uint32_t)(uintptr_t)field, pu_before, seen);
+    return 0;
+}
