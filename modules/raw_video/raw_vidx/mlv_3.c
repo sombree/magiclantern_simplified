@@ -47,6 +47,7 @@
 
 #include "raw_vid.h" // FIXME only for debug logging, probably move the SEND macro to main log.h
 #include "mlv_3.h"
+#include "rp_crx_format.h"
 
 #define MLV_VERSION_STRING "v3.0"
 #define MLV_VIDEO_CLASS_RAW          0x01
@@ -57,6 +58,7 @@
 #define MLV_VIDEO_CLASS_FLAG_LZMA    0x80
 #define MLV_VIDEO_CLASS_FLAG_DELTA   0x40
 #define MLV_VIDEO_CLASS_FLAG_LJ92    0x20
+#define MLV_VIDEO_CLASS_FLAG_CRX     RP_CRX_VIDEO_CLASS_FLAG
 
 #define MLV_AUDIO_CLASS_FLAG_LZMA    0x80
 
@@ -387,6 +389,8 @@ static int session_in_progress = 0;
 static int session_fps = 0;
 static int session_res_x = 0;
 static int session_res_y = 0;
+static int session_bits_per_pixel = 14;
+static int session_wire_bits_per_pixel = 14;
 static int session_crop_offset_x = 0;
 static int session_crop_offset_y = 0;
 static int session_pan_offset_x = 0;
@@ -394,6 +398,7 @@ static int session_pan_offset_y = 0;
 static uint64_t session_GUID = 0;
 static int session_frame_number = 0;
 static int session_image_data_alignment = 0;
+static int session_native_crx = 0;
 
 static uint64_t prng_lfsr(uint64_t value)
 {
@@ -430,6 +435,21 @@ static uint64_t get_GUID()
     return prng_lfsr(guid);
 }
 
+/* EOS RP native CRX decodes into Canon's normal RAW numeric domain, whose
+ * black pedestal differs from the pre-CRX LiveView source buffer.  Keep this
+ * scoped to session_native_crx; ordinary/uncompressed RAW must continue to use
+ * the source-domain raw_info black level. */
+static int eos_rp_crx_decoded_black_level(int bits_per_pixel)
+{
+    switch (bits_per_pixel)
+    {
+    case 10: return 128;
+    case 12: return 512;
+    case 14: return 2048;
+    default: return -1;
+    }
+}
+
 // Any block passed in must have a valid initialised type member.
 // Everything else will get overwritten.
 static int init_block(mlv_block_header *orig_block)
@@ -450,8 +470,9 @@ static int init_block(mlv_block_header *orig_block)
         block_1->file_num = 0;
         block_1->file_count = 0; //autodetect // FIXME wtf does this mean?  Probably change this
         block_1->file_flags = 4; // "single image mode" FIXME Should perhaps be an enum or define
-        block_1->video_class = MLV_VIDEO_CLASS_RAW; // FIXME handle compression (probably worker.c needs to pass in
-                                                  // these kind of things?)
+        block_1->video_class = MLV_VIDEO_CLASS_RAW;
+        if (session_native_crx)
+            block_1->video_class |= MLV_VIDEO_CLASS_FLAG_CRX;
         block_1->audio_class = 0;
         block_1->video_frame_count = 0; //autodetect
         block_1->audio_frame_count = 0;
@@ -475,13 +496,50 @@ static int init_block(mlv_block_header *orig_block)
         // After copying from the global, MLV 2 updates (or sets??) some fields.
         // Why?  Are these not already populated, in which case maybe they shouldn't
         // be in the global?
-        block_2->raw_info.bits_per_pixel = BPP; // FIXME another global to remove
-        block_2->raw_info.pitch = block_2->raw_info.width * BPP / 8;
+        block_2->raw_info.bits_per_pixel = session_wire_bits_per_pixel;
+        block_2->raw_info.pitch = block_2->raw_info.width * session_wire_bits_per_pixel / 8;
+        block_2->raw_info.frame_size = block_2->raw_info.pitch * block_2->raw_info.height;
         int black14 = block_2->raw_info.black_level;
         int white14 = block_2->raw_info.white_level;
-        int bpp_scaling = (1 << (14 - BPP));
-        block_2->raw_info.black_level = (black14 + bpp_scaling / 2) / bpp_scaling;
+        int bpp_scaling = (1 << (14 - session_bits_per_pixel));
+        int source_black_scaled = (black14 + bpp_scaling / 2) / bpp_scaling;
+        block_2->raw_info.black_level = source_black_scaled;
         block_2->raw_info.white_level = (white14 + bpp_scaling / 2) / bpp_scaling;
+        if (session_wire_bits_per_pixel == 16)
+        {
+            /* EOS RP W3 b0=1: measured LE16 pedestal is 8192 for RAW14
+             * (14-bit black 2048 left-aligned by 2) or 512 for RAW12.
+             * The pre-existing raw_info.black_level can be unrelated to
+             * the samples emitted on this particular W3 transport path.
+             * Keep this metadata correction scoped to full LE16 sessions. */
+            int le16_black = eos_rp_crx_decoded_black_level(session_bits_per_pixel);
+            if (le16_black < 0)
+                return -1;
+            if (session_bits_per_pixel == 14)
+            {
+                le16_black *= 4;
+                block_2->raw_info.white_level *= 4;
+            }
+            block_2->raw_info.black_level = le16_black;
+        }
+
+        if (session_native_crx)
+        {
+            int crx_black = eos_rp_crx_decoded_black_level(session_bits_per_pixel);
+            if (crx_black < 0)
+            {
+                SEND_LOG_DATA_STR("ERROR: unsupported CRX RAWI black-level BPP\n");
+                return -1;
+            }
+
+            block_2->raw_info.black_level = crx_black;
+            char black_log[96];
+            snprintf(black_log, sizeof(black_log),
+                     "CRX RAWI black source=%d decoded=%d bpp=%d white=%d\n",
+                     source_black_scaled, crx_black, session_bits_per_pixel,
+                     block_2->raw_info.white_level);
+            SEND_LOG_DATA_STR(black_log);
+        }
         return 0;
 
     case mlv_RAWC:
@@ -616,8 +674,16 @@ static int init_block(mlv_block_header *orig_block)
 }
 
 // Writes the standard set of MLV file headers to the file.
-// Returns size of written headers.  0 signifies error.
-int write_file_headers(char *start, char *end)
+// Returns size of written headers. 0 signifies error.
+//
+// For CRX revision 2 the exact Canon CMP1 does not exist until the first
+// completed encode.  write_file_headers_crx_v2() is therefore called at that
+// point and emits CRXI v2 in the normal stream-metadata position, before IDNT
+// and before the first VIDF.  write_file_headers() remains the ordinary
+// non-CRX/probe variant.
+static int write_file_headers_impl(char *start, char *end,
+                                   const void *cmp1, uint32_t cmp1_size,
+                                   int32_t value_shift)
 {
     if (start == NULL || end == NULL)
     {
@@ -625,22 +691,25 @@ int write_file_headers(char *start, char *end)
         return 0;
     }
 
+    const int include_crxi = (cmp1 != NULL || cmp1_size != 0u);
+    if (include_crxi)
+    {
+        if (!session_native_crx || cmp1 == NULL || cmp1_size == 0u ||
+            cmp1_size > RP_CRX_META_MAX_BYTES)
+        {
+            SEND_LOG_DATA_STR("ERROR: invalid CRXI v2 CMP1 input\n");
+            return 0;
+        }
+    }
+
     // Always write an MLVI block.
     if (init_block((mlv_block_header *)&file_block))
         return 0;
     int32_t written = file_block.size;
 
-    // In theory, sometimes write metadata blocks.
-    //
-    // TODO write_mlv_chunk_headers() takes a chunk param (basically, a file number),
-    // and only stores these headers in the first file in a session.
-    // Unless "something changes", which is not explained.
-    //
-    // This will need revisiting when we handle splitting MLV into files,
-    // e.g. 4GB limit, card spanning.
-    //
-    // For now, we always write these, and we don't support multi-file MLVs.
-
+    // For now this recorder does not support split MLV files. When splitting
+    // is added, the same CRXI v2 + CMP1 must be repeated in every physical
+    // chunk before its local VIDF blocks.
     if (init_block((mlv_block_header *)&rawi_block))
         return 0;
     written += rawi_block.size;
@@ -648,6 +717,22 @@ int write_file_headers(char *start, char *end)
     if (init_block((mlv_block_header *)&rawc_block))
         return 0;
     written += rawc_block.size;
+
+    struct rp_crxi_v2_block crxi;
+    memset(&crxi, 0, sizeof(crxi));
+    if (include_crxi)
+    {
+        crxi.type = RP_CRX_BLOCK_CRXI;
+        crxi.size = sizeof(crxi) + cmp1_size;
+        crxi.timestamp = get_us_clock() - session_start_timestamp;
+        crxi.version = RP_CRX_FORMAT_VERSION;
+        crxi.header_size = sizeof(crxi);
+        crxi.flags = 0;
+        crxi.value_shift = value_shift;
+        crxi.cmp1_size = cmp1_size;
+        crxi.reserved = 0;
+        written += crxi.size;
+    }
 
     if (init_block((mlv_block_header *)&idnt_block))
         return 0;
@@ -669,21 +754,25 @@ int write_file_headers(char *start, char *end)
         return 0;
     written += wbal_block.size;
 
-    // FIXME do we need this block?  It's complex for something that I've never
-    // seen used.  Let's try without and see if mlvapp, mlvdump and ffplay can handle them.
-    //    fail |= mlv_write_vers_blocks(f, mlv_start_timestamp);
-
-    if (end - start < written)
+    if (end < start || (uint32_t)(end - start) < (uint32_t)written)
     {
-        SEND_LOG_DATA_STR("ERROR: not enough space for headers");
+        SEND_LOG_DATA_STR("ERROR: not enough space for headers\n");
         return 0;
     }
 
-    // write the set of headers
     char *cur = start;
     memcpy(cur, &file_block, file_block.size); cur += file_block.size;
     memcpy(cur, &rawi_block, rawi_block.size); cur += rawi_block.size;
     memcpy(cur, &rawc_block, rawc_block.size); cur += rawc_block.size;
+
+    if (include_crxi)
+    {
+        memcpy(cur, &crxi, sizeof(crxi));
+        cur += sizeof(crxi);
+        memcpy(cur, cmp1, cmp1_size);
+        cur += cmp1_size;
+    }
+
     memcpy(cur, &idnt_block, idnt_block.size); cur += idnt_block.size;
     memcpy(cur, &expo_block, expo_block.size); cur += expo_block.size;
     memcpy(cur, &lens_block, lens_block.size); cur += lens_block.size;
@@ -692,6 +781,19 @@ int write_file_headers(char *start, char *end)
 
     return written;
 }
+
+int write_file_headers(char *start, char *end)
+{
+    return write_file_headers_impl(start, end, NULL, 0u, 0);
+}
+
+int write_file_headers_crx_v2(char *start, char *end,
+                              const void *cmp1, uint32_t cmp1_size,
+                              int32_t value_shift)
+{
+    return write_file_headers_impl(start, end, cmp1, cmp1_size, value_shift);
+}
+
 
 // If there's enough space between start and end to hold the VIDF header,
 // padding, and image data of size image_size, write the header and padding
@@ -705,7 +807,9 @@ int write_file_headers(char *start, char *end)
 // to the caller, and EDMAC copy functionality is not needed in this library.
 // The caller is free to use whatever fast copy is available for the large
 // image data.
-char *write_video_frame_header(uint32_t image_size, char *start, char *end)
+static char *write_video_frame_header_impl(uint32_t image_size,
+                                           uint32_t padded_block_size,
+                                           char *start, char *end)
 {
     if (start == NULL || end == NULL)
         return NULL;
@@ -717,11 +821,19 @@ char *write_video_frame_header(uint32_t image_size, char *start, char *end)
     {   // overflow
         return NULL;
     }
-    if (image_start + image_size > end) // doesn't fit
+
+    uint32_t exact_size = (uint32_t)((image_start + image_size) - start);
+    uint32_t block_size = padded_block_size ? padded_block_size : exact_size;
+
+    if (block_size < exact_size)
+        return NULL;
+    if (start + block_size < start)
+        return NULL;
+    if (start + block_size > end)
         return NULL;
 
     // write vidf header to buf_start
-    vidf_block.size = (image_start + image_size) - start;
+    vidf_block.size = block_size;
     vidf_block.timestamp = get_us_clock();
     vidf_block.frame_number = session_frame_number;
     vidf_block.crop_offset_x = session_crop_offset_x;
@@ -732,7 +844,74 @@ char *write_video_frame_header(uint32_t image_size, char *start, char *end)
     memcpy(start, &vidf_block, sizeof(mlv_vidf_block));
     memset(((mlv_vidf_block *)start)->frame_data, 0, vidf_block.frame_padding);
 
+    /* mlv_lite deliberately makes each VIDF block a multiple of 512 bytes for
+     * card write speed.  The RAW payload size is defined by RAWI geometry/BPP,
+     * so any remaining bytes at the end of blockSize are harmless block-local
+     * padding and must be deterministic when several blocks are batched. */
+    if (block_size > exact_size)
+        memset(image_start + image_size, 0, block_size - exact_size);
+
     session_frame_number++;
+    return image_start;
+}
+
+char *write_video_frame_header(uint32_t image_size, char *start, char *end)
+{
+    return write_video_frame_header_impl(image_size, 0, start, end);
+}
+
+char *write_video_frame_header_padded(uint32_t image_size, uint32_t block_size,
+                                      char *start, char *end)
+{
+    return write_video_frame_header_impl(image_size, block_size, start, end);
+}
+
+char *write_video_frame_header_crx_v2(uint32_t image_size,
+                                      char *start, char *end,
+                                      uint32_t *block_size_out)
+{
+    if (block_size_out)
+        *block_size_out = 0;
+
+    if (start == NULL || end == NULL)
+        return NULL;
+
+    /*
+     * MLV CRX container revision 2:
+     *   VIDF header
+     *   frameSpace (leading padding only)
+     *   exact Canon CRX sample
+     *   END OF BLOCK
+     *
+     * Keep the whole VIDF block sector-aligned for the mlv_lite-style
+     * zero-copy writer, but never append trailing bytes after the CRX sample.
+     */
+    uint32_t minimum = sizeof(mlv_vidf_block) + image_size;
+    uint32_t block_size = ALIGN_UP(minimum, 512u);
+    if (block_size < minimum)
+        return NULL;
+    if (start + block_size < start || start + block_size > end)
+        return NULL;
+
+    uint32_t frame_space = block_size - minimum;
+    char *image_start = start + sizeof(mlv_vidf_block) + frame_space;
+
+    vidf_block.size = block_size;
+    vidf_block.timestamp = get_us_clock();
+    vidf_block.frame_number = session_frame_number;
+    vidf_block.crop_offset_x = session_crop_offset_x;
+    vidf_block.crop_offset_y = session_crop_offset_y;
+    vidf_block.pan_offset_x = session_pan_offset_x;
+    vidf_block.pan_offset_y = session_pan_offset_y;
+    vidf_block.frame_padding = frame_space;
+
+    memcpy(start, &vidf_block, sizeof(mlv_vidf_block));
+    if (frame_space)
+        memset(((mlv_vidf_block *)start)->frame_data, 0, frame_space);
+
+    session_frame_number++;
+    if (block_size_out)
+        *block_size_out = block_size;
     return image_start;
 }
 
@@ -772,13 +951,32 @@ int start_mlv_session(struct mlv_session *session)
     session_fps = session->fps;
     session_res_x = session->res_x;
     session_res_y = session->res_y;
+    session_bits_per_pixel = session->bits_per_pixel;
+    session_wire_bits_per_pixel = session->wire_bits_per_pixel
+        ? session->wire_bits_per_pixel : session_bits_per_pixel;
+    if (session_wire_bits_per_pixel != session_bits_per_pixel &&
+        !(session_wire_bits_per_pixel == 16 &&
+          (session_bits_per_pixel == 12 || session_bits_per_pixel == 14)))
+        return -1;
+    session_crop_offset_x = session->crop_offset_x;
+    session_crop_offset_y = session->crop_offset_y;
+    session_pan_offset_x = session->pan_offset_x;
+    session_pan_offset_y = session->pan_offset_y;
     session_start_timestamp = get_us_clock();
     session_GUID = get_GUID();
     session_frame_number = 0;
     session_image_data_alignment = session->image_data_alignment;
+    session_native_crx = session->native_crx ? 1 : 0;
 
     session_in_progress = 1;
     return 0;
+}
+
+uint64_t mlv_get_session_timestamp(void)
+{
+    if (!session_in_progress)
+        return 0;
+    return (uint64_t)get_us_clock() - session_start_timestamp;
 }
 
 int stop_mlv_session()
