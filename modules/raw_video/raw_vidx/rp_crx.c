@@ -1811,3 +1811,298 @@ int raw_vid_rp_crx_encode_source_mode(void *source, uint32_t source_width,
 
     return 0;
 }
+
+
+int raw_vid_rp_crx_encode_source(void *source, uint32_t source_width,
+                                 uint32_t x, uint32_t y,
+                                 uint32_t width, uint32_t height,
+                                 uint32_t bits, struct rp_crx_result *out)
+{
+    return raw_vid_rp_crx_encode_source_mode(source, source_width,
+                                             x, y, width, height,
+                                             bits, 0, out);
+}
+
+/* Preserve the exact v20.1 tight-buffer ABI for all experiment paths.
+ * Keeping this as a wrapper is deliberate: latch/retry/cursor experiments
+ * must not silently inherit direct-W3 source geometry. */
+int raw_vid_rp_crx_encode(void *tight_src, uint32_t width, uint32_t height,
+                          uint32_t bits, struct rp_crx_result *out)
+{
+    return raw_vid_rp_crx_encode_source(tight_src, width,
+                                        0u, 0u, width, height,
+                                        bits, out);
+}
+
+int raw_vid_rp_crx_free(uint32_t handle)
+{
+    if (!handle)
+        return -20;
+
+    rp_crx_free_fn free_encode =
+        RP_THUMB_FN(RP_CRX_FREE_ENC_BUFFER, rp_crx_free_fn);
+
+    g_free_pending++;
+    rp_crx_barrier();
+
+    int rc = (int)free_encode(handle,
+                              (uint32_t)(uintptr_t)&rp_crx_free_complete_cb,
+                              handle);
+    if (rc & 1)
+    {
+        if (g_free_pending != 0u)
+            g_free_pending--;
+        g_free_callback_errors++;
+        rp_crx_barrier();
+    }
+    return rc;
+}
+
+static int rp_crx_wait_all_frees(void)
+{
+    uint32_t t0 = get_us_clock();
+    for (;;)
+    {
+        rp_crx_barrier();
+        if (g_free_pending == 0u)
+            break;
+        if ((uint32_t)(get_us_clock() - t0) >= RP_CRX_FREE_TIMEOUT_US)
+        {
+            RP_CRX_TRACE("FREE wait TIMEOUT pending=%d done=%d cb_err=%d",
+                         (int)g_free_pending, (int)g_free_completed,
+                         (int)g_free_callback_errors);
+            return -30;
+        }
+        msleep(1);
+    }
+
+    if (g_free_callback_errors != 0u)
+    {
+        RP_CRX_TRACE("FREE callback FAIL done=%d cb_err=%d",
+                     (int)g_free_completed, (int)g_free_callback_errors);
+        return -31;
+    }
+    return 0;
+}
+
+static uint32_t rp_crx_count_nonzero_latches(uint32_t manager)
+{
+    uint32_t nonzero = 0;
+    volatile uint32_t *base =
+        (volatile uint32_t *)(uintptr_t)(manager + RP_CRX_ALGSMGR_LATCH_OFFSET);
+    for (uint32_t i = 0; i < RP_CRX_ALGSMGR_LATCH_COUNT; i++)
+        if (base[i] != 0u)
+            nonzero++;
+    return nonzero;
+}
+
+int raw_vid_rp_crx_end_session(void)
+{
+    g_session_clean_end = 0u;
+    if (!is_camera("RP", "1.6.0"))
+        return -32;
+    if (g_active)
+        return -33;
+    if (g_poisoned)
+    {
+        (void)rp_crx_v22_restore_state_wrapper();
+        return -34;
+    }
+
+    /* Keep the v10 improvement that closes the asynchronous FreeEncBuffer
+     * lifecycle.  The completion callback is Canon-owned and is the only
+     * reliable indication that the CRX result handles are actually gone. */
+    int rc = rp_crx_wait_all_frees();
+    if (rc)
+    {
+        int restore_rc = rp_crx_v22_restore_state_wrapper();
+        g_poisoned = 1;
+        g_stats.poisoned = 1;
+        return restore_rc ? restore_rc : rc;
+    }
+
+    /* Dynamic-only production policy: every successful CRX/C-RAW session
+     * must finish by reclaiming its exact ML-owned arena tail and clearing the
+     * selected Canon init latch.  There is no persistent-bank fallback. */
+    g_reclaim_requested = 1u;
+    rp_crx_barrier();
+    uint32_t expected_post = g_free_completed;
+    int post_rc = rp_crx_v22_wait_post_free(expected_post);
+    int reclaim_rc = post_rc;
+    if (!post_rc && !g_reclaim_attempted)
+        reclaim_rc = rp_crx_v22_try_reclaim(2u);
+    else if (!post_rc)
+        reclaim_rc = g_reclaim_last_rc;
+
+    int restore_rc = rp_crx_v22_restore_state_wrapper();
+    RP_CRX_TRACE("V23.2 RECLAIM route=%d/%d post=%d/%d cand=%d attempt=%d path=%d rc=%d restore=%d pre=%x tail=%x",
+                 (int)g_route_type,(int)g_route_id,
+                 (int)g_free_post_completed,(int)expected_post,
+                 (int)g_reclaim_candidate_valid,(int)g_reclaim_attempted,
+                 (int)g_reclaim_last_path,reclaim_rc,restore_rc,
+                 g_reclaim_pre.cursor,g_reclaim_tail.cursor);
+    if (post_rc || reclaim_rc || restore_rc)
+    {
+        if (restore_rc || g_reclaim_write_started)
+        {
+            g_poisoned = 1u;
+            g_stats.poisoned = 1u;
+        }
+        return post_rc ? post_rc : (reclaim_rc ? reclaim_rc : restore_rc);
+    }
+
+    if (g_encoder_latched_bits != 0u)
+    {
+        uint32_t manager = *(volatile uint32_t *)RP_CRX_ALGSMGR_OWNER_SLOT;
+        uint32_t mode = 0u;
+        uint32_t nz = 0u;
+        uint32_t h0 = 0xffffffffu;
+        uint32_t h2 = 0xffffffffu;
+        uint32_t h8 = 0xffffffffu;
+        uint32_t h9 = 0xffffffffu;
+        uint32_t h10 = 0xffffffffu;
+        uint32_t h11 = 0xffffffffu;
+        if (manager != 0u)
+        {
+            mode = *(volatile uint32_t *)(uintptr_t)
+                (manager + RP_CRX_ALGSMGR_MODE_OFFSET);
+            nz = rp_crx_count_nonzero_latches(manager);
+            h0 = rp_crx_hw_latch(manager, RP_CRX_ENCODER_ID_14BIT);
+            h2 = rp_crx_hw_latch(manager, RP_CRAW_ENCODER_ID_14BIT);
+            h8 = rp_crx_hw_latch(manager, RP_CRX_ENCODER_ID_12BIT);
+            h9 = rp_crx_hw_latch(manager, RP_CRX_ENCODER_ID_10BIT);
+            h10 = rp_crx_hw_latch(manager, RP_CRAW_ENCODER_ID_12BIT);
+            h11 = rp_crx_hw_latch(manager, RP_CRAW_ENCODER_ID_10BIT);
+        }
+        RP_CRX_TRACE("BANKS mgr=%x mode=%x nz=%d id0=%d/%d id2=%d/%d id8=%d/%d id9=%d/%d id10=%d/%d id11=%d/%d frees=%d",
+                     manager, mode, (int)nz,
+                     (int)g_encoder_bank_bits[RP_CRX_ENCODER_ID_14BIT], (int)h0,
+                     (int)g_encoder_bank_bits[RP_CRAW_ENCODER_ID_14BIT], (int)h2,
+                     (int)g_encoder_bank_bits[RP_CRX_ENCODER_ID_12BIT], (int)h8,
+                     (int)g_encoder_bank_bits[RP_CRX_ENCODER_ID_10BIT], (int)h9,
+                     (int)g_encoder_bank_bits[RP_CRAW_ENCODER_ID_12BIT], (int)h10,
+                     (int)g_encoder_bank_bits[RP_CRAW_ENCODER_ID_10BIT], (int)h11,
+                     (int)g_free_completed);
+    }
+
+    /* All asynchronous result handle frees have completed.  The caller
+     * still must finish RAW-LV, writer/file and RP backend teardown. */
+    g_session_clean_end = 1u;
+    rp_crx_barrier();
+    return 0;
+}
+
+/* v18 hypothetical tail-rewind feasibility classification. Read-only.
+ * Important: matching values are snapshots, NOT proof of atomic ownership;
+ * Canon may allocate/recycle between samples, and hidden DMA refs remain.
+ * Do not turn CANDIDATE_UNPROVEN into a write authorization. */
+void raw_vid_rp_crx_tail_audit_after_stop(int clean_stop)
+{
+    if (g_v19_active) rp_crx_v19_stop(clean_stop);
+    if (!g_tail_audit.enabled) return;
+    /* Consume the observation once. No caller can accidentally re-arm it. */
+    g_tail_audit.enabled = 0u;
+    if (!g_tail_audit.before_valid || !g_tail_audit.after_valid)
+    {
+        RP_CRX_TRACE("V18 TAIL BLOCK snapshot missing before=%d after=%d",
+                     (int)g_tail_audit.before_valid, (int)g_tail_audit.after_valid);
+        return;
+    }
+    const struct rp_crx_bank_snapshot *a = &g_tail_audit.before;
+    const struct rp_crx_bank_snapshot *b = &g_tail_audit.after;
+    uint32_t id = g_tail_audit.id;
+    uint32_t manager = *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    struct rp_crx_bank_snapshot now;
+    int snap_rc = rp_crx_bank_snapshot(manager, id, &now);
+    RP_CRX_TRACE("V18 TAIL RANGE id=%d bpp=%d wh=%d,%d start=%x end=%x bytes=%x",
+                 (int)id, (int)g_tail_audit.bits,
+                 (int)g_tail_audit.width,(int)g_tail_audit.height,
+                 a->cursor,b->cursor,
+                 b->cursor >= a->cursor ? b->cursor-a->cursor : 0xffffffffu);
+    if (!clean_stop || !g_session_clean_end || g_poisoned || g_active ||
+        g_free_pending || g_free_callback_errors || g_state_probe_armed ||
+        g_session_encode_attempts != 1u || g_session_good_encodes != 1u ||
+        g_session_multi_bits || manager != g_session_manager ||
+        id >= RP_CRX_ALGSMGR_LATCH_COUNT || snap_rc ||
+        !rp_crx_snapshot_arena_valid(&now))
+    {
+        RP_CRX_TRACE("V18 TAIL BLOCK stop/state ok=%d enc=%d good=%d mgr=%x rc=%d",
+                     clean_stop,(int)g_session_encode_attempts,
+                     (int)g_session_good_encodes,manager,snap_rc);
+        return;
+    }
+    if (a->backend == b->backend && a->cursor == b->cursor)
+    {
+        RP_CRX_TRACE("V18 TAIL NO_NEW_ALLOCATION id=%d cursor=%x old_l=%d new_l=%d",
+                     (int)id, b->cursor, (int)a->latch, (int)b->latch);
+        RP_CRX_TRACE("V18 TAIL NO_WRITE: existing bank reused; no allocator tail to recycle");
+        if (raw_vid_get_crx_tail_audit() == 3)
+            RP_CRX_TRACE("V20 RECLAIM none id=%d: legacy reused a latched bank; future policy would not select it",
+                         (int)id);
+        return;
+    }
+    if (a->backend != b->backend || b->backend != now.backend ||
+        a->context != b->context || b->context != now.context ||
+        a->mode != b->mode || b->mode != now.mode ||
+        now.mode != RP_CRX_MODE_LOSSLESS ||
+        a->arena_base != b->arena_base || b->arena_base != now.arena_base ||
+        a->arena_size != b->arena_size || b->arena_size != now.arena_size ||
+        b->cursor != now.cursor ||
+        a->cursor < a->arena_base || b->cursor <= a->cursor ||
+        b->cursor >= b->arena_base + b->arena_size ||
+        now.latch != 1u || now.hw_active != 0u ||
+        a->latch != 0u ||
+        memcmp(now.pointers, b->pointers, sizeof(now.pointers)) != 0)
+    {
+        RP_CRX_TRACE("V18 TAIL BLOCK epoch/cursor/latch pre=%x post=%x now=%x l=%d hw=%d",
+                     a->cursor,b->cursor,now.cursor,
+                     (int)now.latch,(int)now.hw_active);
+        return;
+    }
+    uint32_t conflicts = 0u, unknown = 0u, active = 0u;
+    uint32_t cursor = now.cursor;
+    for (uint32_t other=0;other<RP_CRX_ALGSMGR_LATCH_COUNT;other++)
+    {
+        if (other == id) continue;
+        struct rp_crx_bank_snapshot s;
+        if (rp_crx_bank_snapshot(manager,other,&s) ||
+            s.backend != now.backend || s.mode != now.mode ||
+            s.cursor != cursor || s.context == 0u)
+        {
+            unknown++;
+            continue;
+        }
+        if (s.hw_active) active++;
+        for (unsigned p=0;p<5u;p++)
+        {
+            uint32_t addr=s.pointers[p];
+            if (addr >= a->cursor && addr < b->cursor)
+            {
+                if (conflicts < 6u)
+                    RP_CRX_TRACE("V18 TAIL COLLISION id=%d p=%d addr=%x latch=%d hw=%d",
+                                 (int)other,(int)p,addr,(int)s.latch,
+                                 (int)s.hw_active);
+                conflicts++;
+            }
+        }
+    }
+    /* A second read can detect some transitions, never prove that no
+     * interleaving occurred between these non-atomic observations. */
+    if (manager != *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT ||
+        now.backend != *(volatile uint32_t *)(uintptr_t)RP_CRX_BACKEND_SLOT ||
+        cursor != *(volatile uint32_t *)(uintptr_t)(now.backend+0x14u))
+        unknown++;
+    RP_CRX_TRACE("V18 TAIL CHECK other_collisions=%d unknown=%d other_hw=%d",
+                 (int)conflicts,(int)unknown,(int)active);
+    if (conflicts || unknown || active)
+    {
+        RP_CRX_TRACE("V18 TAIL BLOCK competing workspace/unstable state");
+        return;
+    }
+    RP_CRX_TRACE("V18 TAIL CANDIDATE_UNPROVEN start=%x end=%x bytes=%x",
+                 a->cursor,b->cursor,b->cursor-a->cursor);
+    if (raw_vid_get_crx_tail_audit() == 3)
+        RP_CRX_TRACE("V20 WOULD_RECLAIM id=%d latch=1->0 cursor=%x->%x bytes=%x READ_ONLY",
+                     (int)id,b->cursor,a->cursor,b->cursor-a->cursor);
+    RP_CRX_TRACE("V18 TAIL NO_WRITE: stale DMA/IRQ/timer refs and arena ownership remain UNPROVEN");
+}
