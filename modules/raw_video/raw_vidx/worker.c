@@ -1559,6 +1559,350 @@ static int rp_queue_frame_slot_write(struct rp_frame_slot *slot)
                    (int)free_count, (int)rp_count_reserved_frame_slots());
     return 0;
 }
+
+static uint32_t rp_batch_bytes(struct rp_frame_slot **batch,
+                               uint32_t count)
+{
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < count; i++)
+    {
+        if (batch[i] == NULL || total > 0xFFFFFFFFu - batch[i]->used)
+            return 0;
+        total += batch[i]->used;
+    }
+    return total;
+}
+
+static struct rp_v112_decision rp_v112_writer_pressure(uint32_t free_slots)
+{
+    struct rp_v112_pressure in;
+    struct rp_v112_decision out;
+    in.free_bytes = rp_v112_free_bytes();
+    in.free_slots = free_slots;
+    in.ingress_x100 = rp_writer_ingress_rate_x100;
+    in.drain_x100 = rp_writer_drain_rate_x100;
+    in.writer_x100 = rp_writer_rate_x100;
+    in.fps_x1000 = session.fps > 0 ? (uint32_t)session.fps : 0u;
+    in.draining = rp_writer_drain_requested;
+    rp_v112_pressure_decide(&in, &out);
+    return out;
+}
+
+static uint32_t rp_collect_contiguous_full_slots(struct rp_frame_slot *first,
+                                                  struct rp_frame_slot **batch,
+                                                  uint32_t max_slots)
+{
+    if (first == NULL || max_slots == 0u || rp_slot_lock())
+        return 0;
+
+    if (first->state != RP_FRAME_SLOT_FULL || first->used == 0u)
+    {
+        rp_slot_unlock();
+        return 0;
+    }
+
+    if (first->used > RP_FIO_MAX_BATCH_BYTES)
+    {
+        rp_slot_unlock();
+        return 0;
+    }
+    batch[0] = first;
+    uint32_t count = 1u;
+    uint32_t total_bytes = first->used;
+    struct rp_frame_slot *prev = first;
+
+    while (count < max_slots)
+    {
+        struct rp_frame_slot *next =
+            rp_find_full_frame_slot_locked(first->frame_number + count);
+        if (next == NULL || next->used == 0u)
+            break;
+
+        /* Variable-size compressed VIDFs may be grouped as long as the actual
+         * used prefixes are physically adjacent. */
+        if (next->chunk_index != prev->chunk_index ||
+            next->start != prev->start + prev->used)
+            break;
+        if (next->used > RP_FIO_MAX_BATCH_BYTES ||
+            total_bytes > RP_FIO_MAX_BATCH_BYTES - next->used)
+            break;
+
+        batch[count++] = next;
+        total_bytes += next->used;
+        prev = next;
+    }
+
+    rp_slot_unlock();
+    return count;
+}
+
+/* True only when there is still a physical place for the next frame
+ * directly after this contiguous run.  Never wait to merge across holes or
+ * between memSuite chunks.  A FREE neighbor is only a possibility: producer
+ * might choose a different chunk, so the wait remains strictly bounded. */
+static int rp_batch_can_extend(struct rp_frame_slot **batch, uint32_t count)
+{
+    if (!count || rp_slot_lock()) return 0;
+    struct rp_frame_slot *last = batch[count - 1u];
+    uint32_t next_frame = last->frame_number + 1u;
+    char *expected = last->start + last->used;
+    int possible = 0;
+    if (last->chunk_index < rp_frame_chunk_count)
+    {
+        struct rp_frame_chunk *chunk = &rp_frame_chunks[last->chunk_index];
+        if (expected < chunk->start + chunk->bytes)
+        {
+            for (uint32_t n = chunk->first_slot;
+                 n < chunk->first_slot + chunk->slot_count &&
+                 n < rp_frame_slot_count; ++n)
+            {
+                struct rp_frame_slot *s = &rp_frame_slots[n];
+                if (s->start != expected) continue;
+                if ((s->state == RP_FRAME_SLOT_CAPTURING &&
+                     s->frame_number == next_frame) ||
+                    (s->state == RP_FRAME_SLOT_FREE &&
+                     (uint32_t)(s->end - s->start) >= rp_frame_slot_stride))
+                {
+                    possible = 1;
+                }
+                break;
+            }
+        }
+    }
+    rp_slot_unlock();
+    return possible;
+}
+
+/* Keep whole VIDF records.  No intermediate arena and no partial block cuts.
+ * Prefer the closest prefix to the learned target without exceeding 128 MiB. */
+static uint32_t rp_select_target_prefix(struct rp_frame_slot **batch,
+                                        uint32_t count, uint32_t target_bytes,
+                                        uint32_t allowed_bytes)
+{
+    if (!count || batch[0]->used > allowed_bytes) return 0;
+    uint32_t bytes = batch[0]->used;
+    uint32_t n = 1u;
+    while (n < count)
+    {
+        uint32_t next_bytes = batch[n]->used;
+        if (next_bytes > allowed_bytes ||
+            bytes > allowed_bytes - next_bytes)
+            break;
+        uint32_t with_next = bytes + next_bytes;
+        if (bytes >= target_bytes) break;
+        if (with_next > target_bytes && n > 0u &&
+            with_next - target_bytes >= target_bytes - bytes)
+            break;
+        bytes = with_next;
+        ++n;
+    }
+    return n;
+}
+
+static uint32_t rp_wait_for_coalesce(struct rp_frame_slot *first,
+                                     struct rp_frame_slot **batch,
+                                     uint32_t candidate_frames,
+                                     uint32_t free_slots,
+                                     uint32_t target_bytes,
+                                     const struct rp_v112_decision *pressure,
+                                     uint32_t *waited_us)
+{
+    if (waited_us) *waited_us = 0;
+    if (first == NULL || candidate_frames == 0u ||
+        rp_writer_drain_requested || free_slots < RP_COALESCE_START_FREE)
+        return candidate_frames;
+
+    uint32_t candidate_bytes = rp_batch_bytes(batch, candidate_frames);
+    if (!candidate_bytes || candidate_bytes >= target_bytes ||
+        !rp_batch_can_extend(batch, candidate_frames))
+        return candidate_frames;
+
+    uint32_t avg = rp_writer_recent_frame_bytes;
+    if (!avg) avg = candidate_bytes / candidate_frames;
+    uint32_t wait_limit = rp_adapt_wait_budget(
+        target_bytes, candidate_bytes, avg, free_slots,
+        (uint32_t)(session.fps > 0 ? session.fps : 0),
+        rp_writer_drain_requested != 0u);
+    wait_limit = rp_v112_pressure_wait(pressure, wait_limit);
+    if (!wait_limit) return candidate_frames;
+
+    uint32_t t0 = get_us_clock();
+    uint32_t candidate = candidate_frames;
+    rp_writer_coalesce_waits++;
+
+    while (candidate_bytes < target_bytes && !rp_writer_drain_requested)
+    {
+        if (rp_count_free_frame_slots() <= RP_COALESCE_ABORT_FREE)
+            break;
+        if ((uint32_t)(get_us_clock() - t0) >= wait_limit)
+            break;
+        if (!rp_batch_can_extend(batch, candidate))
+            break;
+        msleep(1);
+        uint32_t newer = rp_collect_contiguous_full_slots(
+            first, batch, RP_FRAME_SLOT_MAX);
+        if (newer > candidate)
+        {
+            candidate = newer;
+            candidate_bytes = rp_batch_bytes(batch, candidate);
+            if (!candidate_bytes) break;
+        }
+    }
+
+    uint32_t elapsed = (uint32_t)(get_us_clock() - t0);
+    if (waited_us) *waited_us = elapsed;
+    rp_writer_coalesce_total_us += elapsed;
+    if (elapsed > rp_writer_coalesce_max_us)
+        rp_writer_coalesce_max_us = elapsed;
+    if (candidate_bytes >= target_bytes)
+        rp_writer_coalesce_hits++;
+    else
+        rp_writer_coalesce_timeouts++;
+    return candidate;
+}
+
+static int rp_consume_group_queue_tokens(struct rp_frame_slot **batch,
+                                         uint32_t batch_count)
+{
+    for (uint32_t i = 1; i < batch_count; i++)
+    {
+        struct rp_frame_slot *queued = NULL;
+        int rc = msg_queue_receive(rp_write_q, &queued, 100);
+        if (rc || queued != batch[i])
+        {
+            RP_START_TRACE("S36 BATCH token FAIL i=%d rc=%d got=%x exp=%x",
+                           (int)i, rc, (uint32_t)queued, (uint32_t)batch[i]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int rp_write_frame_batch_to_disk(struct rp_frame_slot **batch,
+                                        uint32_t batch_count,
+                                        uint32_t coalesce_wait_us)
+{
+    if (batch == NULL || batch_count == 0u || batch[0] == NULL)
+        return -1;
+
+    if (raw_vid_fp == NULL)
+    {
+        RP_START_TRACE("S36 BATCH write no-fp frame=%d count=%d",
+                       (int)batch[0]->frame_number, (int)batch_count);
+        return -2;
+    }
+
+    uint32_t fio_bytes = 0u;
+    if (rp_slot_lock())
+        return -3;
+
+    for (uint32_t i = 0; i < batch_count; i++)
+    {
+        if (batch[i]->state != RP_FRAME_SLOT_FULL ||
+            batch[i]->used == 0u ||
+            batch[i]->used > RP_FIO_MAX_BATCH_BYTES ||
+            (batch[i]->used & (RP_FRAME_SLOT_ALIGN - 1u)) ||
+            ((uintptr_t)batch[i]->start & (RP_FRAME_SLOT_ALIGN - 1u)) ||
+            (i > 0u &&
+             (batch[i]->chunk_index != batch[i - 1u]->chunk_index ||
+              batch[i]->frame_number != batch[i - 1u]->frame_number + 1u ||
+              batch[i]->start != batch[i - 1u]->start + batch[i - 1u]->used)) ||
+            fio_bytes > RP_FIO_MAX_BATCH_BYTES - batch[i]->used)
+        {
+            rp_slot_unlock();
+            return -4;
+        }
+        batch[i]->state = RP_FRAME_SLOT_WRITING;
+        fio_bytes += batch[i]->used;
+    }
+    rp_slot_unlock();
+
+    uint32_t written = 0u;
+    uint32_t fio_us = 0u;
+
+    if (!rp_header_write_failed)
+    {
+        rp_wait_fio_safe_phase();
+
+        uint64_t fio_t0 = (uint64_t)get_us_clock();
+        RP_START_TRACE("S36 FIO start frame=%d n=%d bytes=%d free=%d prio=%x",
+                       (int)batch[0]->frame_number, (int)batch_count,
+                       (int)fio_bytes, (int)rp_count_free_frame_slots(),
+                       WORKER_PRIO);
+
+        written = FIO_WriteFile(raw_vid_fp, batch[0]->start, fio_bytes);
+        fio_us = (uint32_t)((uint64_t)get_us_clock() - fio_t0);
+    }
+
+    uint32_t rate_x100 = fio_us
+        ? (uint32_t)(((uint64_t)fio_bytes * 100u) / fio_us)
+        : 0u;
+    if (fio_us > rp_writer_max_us)
+        rp_writer_max_us = fio_us;
+
+    if (rate_x100)
+    {
+        if (rp_writer_rate_x100 == 0u)
+            rp_writer_rate_x100 = rate_x100;
+        else
+            rp_writer_rate_x100 =
+                (rp_writer_rate_x100 * 7u + rate_x100) / 8u;
+    }
+
+    rp_writer_batches++;
+    if (batch_count > rp_writer_max_batch_frames)
+        rp_writer_max_batch_frames = batch_count;
+    if (fio_bytes > rp_writer_max_batch_bytes)
+        rp_writer_max_batch_bytes = fio_bytes;
+
+    RP_START_TRACE("S36 FIO done frame=%d n=%d bytes=%d wrote=%d us=%d rate=%d.%02dMBs avg=%d.%02d",
+                   (int)batch[0]->frame_number, (int)batch_count,
+                   (int)fio_bytes, (int)written, (int)fio_us,
+                   (int)(rate_x100 / 100u), (int)(rate_x100 % 100u),
+                   (int)(rp_writer_rate_x100 / 100u),
+                   (int)(rp_writer_rate_x100 % 100u));
+
+    int io_ok = (!rp_header_write_failed && written == fio_bytes);
+    rp_adapt_observe(&rp_adapt, fio_bytes, fio_us, coalesce_wait_us, io_ok);
+    rp_v113_history_observe(&rp_v113_io_history, fio_bytes, fio_us, io_ok);
+    if (io_ok)
+    {
+        uint32_t now_us = get_us_clock();
+        if (!rp_drain_window_t0) rp_drain_window_t0 = now_us;
+        rp_drain_window_bytes += written;
+        uint32_t elapsed_us = now_us - rp_drain_window_t0;
+        if (elapsed_us >= 500000u)
+        {
+            rp_writer_drain_rate_x100 =
+                (uint32_t)((rp_drain_window_bytes * 100u) / elapsed_us);
+            rp_drain_window_bytes = 0;
+            rp_drain_window_t0 = now_us;
+        }
+    }
+    if (!io_ok)
+    {
+        rp_writer_io_fail++;
+        RP_START_TRACE("S36 FIO FAIL headerFail=%d req=%d got=%d",
+                       (int)rp_header_write_failed,
+                       (int)fio_bytes, (int)written);
+        raw_vid_rp_request_stop();
+        raw_vid_request_stop_async();
+    }
+
+    if (!rp_slot_lock())
+    {
+        for (uint32_t i = 0; i < batch_count; i++)
+        {
+            int idx = rp_slot_index(batch[i]);
+            if (idx >= 0)
+                rp_free_frame_slot_locked((uint32_t)idx);
+        }
+        rp_slot_unlock();
+    }
+
+    rp_writer_jobs_done += batch_count;
+    return io_ok ? 0 : -5;
+}
 static void worker(void)
 {
     #ifdef RAW_VID_LOG
