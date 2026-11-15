@@ -1497,3 +1497,317 @@ int raw_vid_rp_crx_begin_session_mode(int lossy)
     rp_crx_barrier();
     return 0;
 }
+
+int raw_vid_rp_crx_begin_session(void)
+{
+    return raw_vid_rp_crx_begin_session_mode(0);
+}
+
+int raw_vid_rp_crx_encode_source_mode(void *source, uint32_t source_width,
+                                      uint32_t x, uint32_t y,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t bits, int lossy,
+                                      struct rp_crx_result *out)
+{
+    if (!is_camera("RP", "1.6.0") || !source || !out)
+        return -10;
+    if (g_poisoned)
+        return -11;
+    if (g_active)
+        return -12;
+    if ((lossy ? 1u : 0u) != g_session_lossy)
+        return -21;
+    if ((bits != 10u && bits != 12u && bits != 14u) ||
+        width == 0u || height == 0u || source_width == 0u ||
+        x > source_width || width > source_width - x ||
+        ((source_width * bits) & 7u) != 0u ||
+        ((x * bits) & 7u) != 0u)
+        return -13;
+    if (((uintptr_t)source & 0x3Fu) != 0u)
+        return -14;
+
+    /* E0651986 asserts if AlgsMgr has not been initialized by Canon.  Probe the
+     * exact owner slot first so an unsupported camera state fails closed. */
+    if (*(volatile uint32_t *)RP_CRX_ALGSMGR_OWNER_SLOT == 0u)
+        return -15;
+
+    uint32_t desc_type = 0u;
+    uint32_t enc_id = 0u;
+    if (rp_crx_route_for_session(bits, lossy, &desc_type, &enc_id) != 0)
+        return -13;
+    if (!g_route_valid || desc_type != g_route_type || enc_id != g_route_id)
+        return -22;
+
+    struct rp_crx_descriptor desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.type = desc_type;
+    desc.width = width;
+    desc.height = height;
+    desc.x = x;
+    desc.y = y;
+    desc.bits = bits;
+    desc.source = (uint32_t)(uintptr_t)source;
+    desc.source_width = source_width;
+
+    /* Lossless v12 uses three existing Canon RAW-like descriptor types solely
+     * to obtain persistent D encoder banks: 14b type0/ID0, 12b type4/ID8,
+     * 10b type5/ID9.  C-RAW uses the paired codec-family routes
+     * 14b type2/ID2, 12b type6/ID10 and 10b type7/ID11.  Canon maps the
+     * C-RAW family to compressor mode 3 while preserving the same high-level
+     * source/ROI descriptor ABI.
+     * The v12 static audit shows the same RAW mapper class (1) for lossless
+     * and no downstream type4/type5 semantic split in INIT_D, D_CONFIG,
+     * DIRECT_START or header creation.  f1c/source_width is the physical source
+     * row width in samples. v20.2 standard capture may additionally provide
+     * non-zero x/y so AlgsMgr reads a logical ROI directly from padded W3.
+     * Historical standalone diagnostic helpers may still call the tight wrapper
+     * below, but normal REC never selects that path.
+     * Unresolved aux words remain zero exactly as before. */
+    RP_CRX_TRACE("DESC lossy=%d type=%d w=%d h=%d xy=%d,%d bits=%d src=%x f1c=%d aux=%x,%x,%x rowB=%d",
+                 lossy ? 1 : 0, (int)desc.type, (int)desc.width, (int)desc.height,
+                 (int)desc.x, (int)desc.y, (int)desc.bits,
+                 desc.source, (int)desc.source_width,
+                 desc.aux0, desc.aux1, desc.aux2,
+                 (int)((desc.source_width * desc.bits) >> 3));
+
+    memset(out, 0, sizeof(*out));
+    out->descriptor_type = desc_type;
+    out->encoder_id = enc_id;
+
+    uint32_t token = g_next_token++;
+    if (token == 0u)
+        token = g_next_token++;
+
+#if RP_CRX_EVENT_WAIT
+    /* Consume a residual binary semaphore token ONLY while no job is active.
+     * The next valid callback will publish the new token after setting g_done.
+     * A late callback after timeout already poisons the session. */
+    if (g_completion_sem)
+        (void)take_semaphore_now(g_completion_sem);
+#endif
+    g_done = 0;
+    g_callback_token = 0;
+    g_callback_count = 0;
+    for (uint32_t i = 0; i < RP_CRX_RESULT_MAX; i++)
+        g_callback_handles[i] = 0;
+    g_active_token = token;
+    rp_crx_barrier();
+
+    rp_crx_start_fn start_encode =
+        RP_THUMB_FN(RP_CRX_START_ENCODE, rp_crx_start_fn);
+
+    /* Repeat the bank-ownership check immediately before submission so a
+     * state change between session preflight and StartEncode cannot silently
+     * route us into an already-configured foreign bank. */
+    rp_crx_barrier();
+    uint32_t manager =
+        *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    uint32_t hw_latch = rp_crx_hw_latch(manager, enc_id);
+    uint32_t sw_bits = g_encoder_bank_bits[enc_id];
+    if (g_session_encode_attempts == 0u)
+    {
+        g_session_first_hw_latch = hw_latch;
+        g_session_first_sw_bits = sw_bits;
+    }
+    g_session_encode_attempts++;
+    if ((sw_bits == 0u && hw_latch != 0u) ||
+        (sw_bits != 0u && sw_bits != bits))
+    {
+        RP_CRX_TRACE("BANK encode reject bits=%d lossy=%d type=%d id=%d sw=%d hw=%d",
+                     (int)bits, lossy ? 1 : 0, (int)desc_type, (int)enc_id,
+                     (int)sw_bits, (int)hw_latch);
+        return -16;
+    }
+
+    if (g_bank_first_width[enc_id] != 0u)
+    {
+        if (width != g_bank_first_width[enc_id] ||
+            height != g_bank_first_height[enc_id])
+        {
+            RP_CRX_TRACE("V15 PROFILE SHIFT id=%d old=%d,%d new=%d,%d",
+                         (int)enc_id,(int)g_bank_first_width[enc_id],
+                         (int)g_bank_first_height[enc_id],(int)width,(int)height);
+            RP_CRX_TRACE("V23.2 REFUSE unexpected geometry shift inside active dynamic slot");
+            return -47;
+        }
+    }
+
+    /* Capture the original allocator cost before the first successful
+     * hardware configuration.  The first frame's callback compares this to
+     * the allocation after Canon has initialized its persistent bank. */
+    if (g_session_encode_attempts == 1u &&
+        rp_crx_bank_snapshot(manager, enc_id, &g_first_encode_before) == 0 &&
+        rp_crx_snapshot_arena_valid(&g_first_encode_before))
+    {
+        g_first_encode_before_valid = 1u;
+        rp_crx_log_snapshot("init-before", enc_id, &g_first_encode_before);
+    }
+    else if (g_session_encode_attempts == 1u)
+    {
+        g_first_encode_before_valid = 0u;
+        RP_CRX_TRACE("BANK SNAP pre-encode unavailable id=%d", (int)enc_id);
+    }
+
+    /* v23.2 normal recording always uses the dynamic reclaim session wrapper
+     * installed by begin_session_mode(); the historical one-shot state-probe
+     * callback is not part of the REC path. */
+
+    g_active = 1;
+    rp_crx_barrier();
+
+    uint32_t t0 = get_us_clock();
+    uint32_t rc = start_encode(&desc, 1u,
+                               (uint32_t)(uintptr_t)&rp_crx_complete_cb,
+                               token);
+    out->submit_rc = rc;
+    g_stats.submitted++;
+
+    /* Return-value semantics of this private Canon entry point are not yet
+     * runtime-proven for synthetic submissions.  The completion callback is
+     * authoritative.  Record non-zero submit values diagnostically, but do
+     * not discard a job that may still complete successfully. */
+    if (rc != 0u)
+        g_stats.submit_errors++;
+
+    rp_crx_barrier();
+    while (!g_done)
+    {
+        uint32_t dt = (uint32_t)(get_us_clock() - t0);
+        if (dt >= RP_CRX_ENCODE_TIMEOUT_US)
+            break;
+#if RP_CRX_EVENT_WAIT
+        if (g_completion_sem)
+        {
+            /* Never perform a task-only take from the Canon callback.
+             * Remaining-time bounded wait ensures <=1s deadline semantics
+             * even if an event is lost or sem give returns an error. */
+            uint32_t wait_ms = rp_crx_wait_budget_ms(
+                dt, RP_CRX_ENCODE_TIMEOUT_US, RP_CRX_EVENT_WAIT_SLICE_MS);
+            if (wait_ms)
+                (void)take_semaphore(g_completion_sem, (int)wait_ms);
+        }
+        else
+#endif
+        {
+            /* Failed semaphore creation: preserve working polling path. */
+            msleep(1);
+        }
+        rp_crx_barrier();
+    }
+
+    uint32_t dt = (uint32_t)(get_us_clock() - t0);
+    rp_crx_barrier();
+    out->encode_us = dt;
+    g_stats.total_encode_us += dt;
+    if (dt > g_stats.max_encode_us)
+        g_stats.max_encode_us = dt;
+
+    if (!g_done)
+    {
+        /* A late callback could otherwise be mistaken for a later frame.  Do
+         * not submit another custom CRX job until a fresh boot/module load. */
+        g_poisoned = 1;
+        g_stats.poisoned = 1;
+        g_stats.timeouts++;
+        g_active = 0;
+        rp_crx_barrier();
+        RP_CRX_TRACE("TIMEOUT token=%x us=%d", token, (int)dt);
+        return -17;
+    }
+
+    rp_crx_barrier();
+    if (g_callback_token != token)
+    {
+        g_poisoned = 1;
+        g_stats.poisoned = 1;
+        g_active = 0;
+        rp_crx_barrier();
+        return -18;
+    }
+
+    out->count = g_callback_count;
+    for (uint32_t i = 0; i < RP_CRX_RESULT_MAX; i++)
+        out->handles[i] = g_callback_handles[i];
+
+    g_stats.completed++;
+    g_active = 0;
+    rp_crx_barrier();
+
+    if (out->count == 0u || out->count > RP_CRX_RESULT_MAX)
+        return -19;
+
+    /* Ownership is committed only after a structurally successful completion.
+     * If init happened but the job failed earlier, the software slot remains
+     * zero while Canon's latch is nonzero; the next preflight then fails
+     * closed and requires a cold boot rather than guessing the bank state. */
+    g_encoder_bank_bits[enc_id] = bits;
+    g_encoder_latched_bits = bits;
+    if (g_bank_first_width[enc_id] == 0u)
+    {
+        g_bank_first_width[enc_id] = width;
+        g_bank_first_height[enc_id] = height;
+    }
+    if (g_session_bits != 0u && g_session_bits != bits)
+        g_session_multi_bits = 1u;
+    g_session_bits = bits;
+    g_session_good_encodes++;
+    if (g_session_good_encodes == 1u)
+    {
+        g_last_good_width = width;
+        g_last_good_height = height;
+    }
+    if (g_session_good_encodes == 1u)
+    {
+        struct rp_crx_bank_snapshot after;
+        if (rp_crx_bank_snapshot(manager, enc_id, &after) == 0 &&
+            rp_crx_snapshot_arena_valid(&after))
+        {
+            rp_crx_log_snapshot("init-after", enc_id, &after);
+            if (g_first_encode_before_valid &&
+                after.backend == g_first_encode_before.backend &&
+                after.cursor >= g_first_encode_before.cursor)
+            {
+                uint32_t delta = after.cursor - g_first_encode_before.cursor;
+                RP_CRX_TRACE("ALLOC delta=%x (%d bytes) id=%d",
+                             delta, (int)delta, (int)enc_id);
+                if (g_route_valid && enc_id == g_route_id &&
+                    g_session_first_hw_latch == 0u &&
+                    g_session_first_sw_bits == 0u && delta > 0u &&
+                    after.latch == 1u &&
+                    g_first_encode_before.backend == after.backend &&
+                    g_first_encode_before.arena_base == after.arena_base &&
+                    g_first_encode_before.arena_size == after.arena_size &&
+                    g_first_encode_before.context == after.context &&
+                    after.pointers[0] >= g_first_encode_before.cursor && after.pointers[0] < after.cursor &&
+                    after.pointers[1] >= g_first_encode_before.cursor && after.pointers[1] < after.cursor &&
+                    after.pointers[2] >= g_first_encode_before.cursor && after.pointers[2] < after.cursor &&
+                    after.pointers[3] >= g_first_encode_before.cursor && after.pointers[3] < after.cursor &&
+                    after.pointers[4] >= g_first_encode_before.cursor && after.pointers[4] < after.cursor)
+                {
+                    g_reclaim_pre = g_first_encode_before;
+                    g_reclaim_tail = after;
+                    g_reclaim_candidate_valid = 1u;
+                    RP_CRX_TRACE("V22 CANDIDATE route=%d/%d pre=%x tail=%x delta=%x hw=%d",
+                                 (int)g_route_type,(int)g_route_id,
+                                 g_reclaim_pre.cursor,g_reclaim_tail.cursor,delta,
+                                 (int)after.hw_active);
+                }
+                if (g_session_first_hw_latch == 0u &&
+                    g_session_first_sw_bits == 0u && delta > 0u)
+                {
+                    g_first_alloc_bytes = delta;
+                    g_first_alloc_valid = 1u;
+                    g_first_init_after = after;
+                    g_first_init_after_valid = 1u;
+                }
+            }
+        }
+        else RP_CRX_TRACE("BANK SNAP post-encode unavailable id=%d", (int)enc_id);
+    }
+    rp_crx_barrier();
+    RP_CRX_TRACE("BANK commit bits=%d lossy=%d type=%d id=%d hw=%d",
+                 (int)bits, lossy ? 1 : 0, (int)desc_type, (int)enc_id,
+                 (int)rp_crx_hw_latch(manager, enc_id));
+
+    return 0;
+}
