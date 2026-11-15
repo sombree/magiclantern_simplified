@@ -2106,3 +2106,301 @@ void raw_vid_rp_crx_tail_audit_after_stop(int clean_stop)
                      (int)id,b->cursor,a->cursor,b->cursor-a->cursor);
     RP_CRX_TRACE("V18 TAIL NO_WRITE: stale DMA/IRQ/timer refs and arena ownership remain UNPROVEN");
 }
+
+/* EOS RP FW1.6.0: manager+0x124+4*ID is the persistent D init latch.
+ * IMPORTANT: resetting this flag does NOT free its allocations.  Canon's next
+ * StartEncode on this ID may enter LOW_D_ALLOC again and overwrite pointers,
+ * consuming more of the shared bump arena.  This is a deliberately risky
+ * single-use experiment, NOT an encoder reset/reinitialization API. */
+int raw_vid_rp_crx_latch_after_stop(uint32_t bits, int mode)
+{
+    uint32_t desc_type = 0u, enc_id = 0u;
+    if (!is_camera("RP", "1.6.0") ||
+        (mode != 1 && mode != 2 && mode != 3 && mode != 4) ||
+        rp_crx_select_bank(bits, &desc_type, &enc_id) != 0)
+        return -50;
+
+    rp_crx_barrier();
+    uint32_t manager =
+        *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    if (manager < 0x1000u || manager >= 0xE0000000u ||
+        (manager & 3u) || manager != g_session_manager)
+    {
+        RP_CRX_TRACE("LATCHTEST REJECT manager current=%x session=%x",
+                     manager, g_session_manager);
+        return -51;
+    }
+
+    uint32_t old = rp_crx_hw_latch(manager, enc_id);
+    uint32_t sw = g_encoder_bank_bits[enc_id];
+    uint32_t manager_mode = *(volatile uint32_t *)(uintptr_t)
+        (manager + RP_CRX_ALGSMGR_MODE_OFFSET);
+    RP_CRX_TRACE("LATCHTEST BEFORE act=%d mgr=%x mode=%x id=%d type=%d bpp=%d hw=%d sw=%d",
+                 mode, manager, manager_mode, (int)enc_id, (int)desc_type,
+                 (int)bits, (int)old, (int)sw);
+    RP_CRX_TRACE("LATCHTEST STATE init_mode=%x first=%d/%d attempts=%d ok=%d clean=%d active=%d free=%d poison=%d",
+                 g_session_manager_mode, (int)g_session_first_hw_latch,
+                 (int)g_session_first_sw_bits, (int)g_session_encode_attempts,
+                 (int)g_session_good_encodes, (int)g_session_clean_end,
+                 (int)g_active, (int)g_free_pending, (int)g_poisoned);
+
+    if (mode == 1)
+    {
+        RP_CRX_TRACE("LATCHTEST OBSERVE no write id=%d hw=%d", (int)enc_id, (int)old);
+        return 0;
+    }
+    if (mode == 4)
+    {
+        int mrc = rp_crx_multi_after_stop(bits, enc_id, manager);
+        if (mrc)
+        {
+            RP_CRX_TRACE("V16 RESET REFUSED id=%d rc=%d",(int)enc_id,mrc);
+            g_poisoned = 1u;
+            g_stats.poisoned = 1u;
+        }
+        return mrc;
+    }
+
+    struct rp_crx_bank_snapshot snapshot;
+    int snapshot_rc = rp_crx_bank_snapshot(manager, enc_id, &snapshot);
+    if (snapshot_rc == 0)
+        rp_crx_log_snapshot("poststop-before-clear", enc_id, &snapshot);
+    /* Failed or changed session, outstanding callback, manager ownership
+     * change, wrong bank, or already-cleared latch => never write.  These
+     * guards cannot prove Canon has no OTHER outstanding native work. */
+    if (g_latch_reset_attempted || g_active || g_poisoned ||
+        g_free_pending || g_state_probe_armed || !g_session_clean_end ||
+        g_session_good_encodes == 0u || g_session_multi_bits ||
+        g_session_bits != bits || sw != bits || old != 1u ||
+        g_last_good_width == 0u || g_last_good_height == 0u ||
+        g_session_first_hw_latch != 0u || g_session_first_sw_bits != 0u ||
+        manager_mode != g_session_manager_mode || snapshot_rc != 0 ||
+        !rp_crx_snapshot_arena_valid(&snapshot) ||
+        snapshot.hw_active != 0u || !g_first_alloc_valid ||
+        !g_first_init_after_valid ||
+        snapshot.backend != g_first_init_after.backend ||
+        snapshot.context != g_first_init_after.context ||
+        snapshot.cursor != g_first_init_after.cursor ||
+        snapshot.pointers[0] != g_first_init_after.pointers[0] ||
+        snapshot.pointers[1] != g_first_init_after.pointers[1] ||
+        snapshot.pointers[2] != g_first_init_after.pointers[2] ||
+        snapshot.pointers[3] != g_first_init_after.pointers[3] ||
+        snapshot.pointers[4] != g_first_init_after.pointers[4] ||
+        g_first_alloc_bytes == 0u ||
+        g_first_alloc_bytes >=
+            (snapshot.arena_base + snapshot.arena_size - snapshot.cursor))
+    {
+        RP_CRX_TRACE("LATCHTEST REJECT tried=%d bits=%d session=%d multi=%d sw=%d hw=%d",
+                     (int)g_latch_reset_attempted, (int)bits,
+                     (int)g_session_bits, (int)g_session_multi_bits,
+                     (int)sw, (int)old);
+        return -52;
+    }
+
+    volatile uint32_t *latch = (volatile uint32_t *)(uintptr_t)
+        (manager + RP_CRX_ALGSMGR_LATCH_OFFSET + 4u * enc_id);
+
+    /* Consume single-reset budget BEFORE the store; only a successful
+     * readback arms a *single* same-ID replay.  Do not modify cursor, arena,
+     * saved workspace pointers, hardware lease or the global Canon mode. */
+    g_latch_reset_attempted = 1u;
+    g_retry_state = RP_CRX_RETRY_FINISHED; /* refuse REC until readback passes */
+    g_retry_bits = bits;
+    g_retry_width = g_last_good_width;
+    g_retry_height = g_last_good_height;
+    g_retry_id = enc_id;
+    g_retry_manager = manager;
+    g_retry_mode = manager_mode;
+    g_preclear_snapshot = snapshot;
+    rp_crx_barrier();
+
+    *latch = 0u;
+    rp_crx_barrier();
+    uint32_t after = *latch;
+    RP_CRX_TRACE("LATCHTEST WRITE mgr=%x id=%d addr=%x before=%d after=%d (coldboot mandatory)",
+                 manager, (int)enc_id, (uint32_t)(uintptr_t)latch,
+                 (int)old, (int)after);
+
+    if (after != 0u)
+    {
+        g_poisoned = 1u;
+        g_stats.poisoned = 1u;
+        return -53;
+    }
+    g_retry_state = RP_CRX_RETRY_ARMED;
+    rp_crx_barrier();
+    RP_CRX_TRACE("RETRY ARMED id=%d bits=%d wh=%d,%d", (int)enc_id,
+                 (int)bits, (int)g_retry_width, (int)g_retry_height);
+    return 0;
+}
+
+void raw_vid_rp_crx_retry_finish(int clean_stop)
+{
+    if (!g_latch_reset_attempted || g_retry_state != RP_CRX_RETRY_RUNNING)
+        return;
+    struct rp_crx_bank_snapshot s;
+    int rc = rp_crx_bank_snapshot(g_retry_manager, g_retry_id, &s);
+    if (!rc)
+    {
+        rp_crx_log_snapshot("retry-stop", g_retry_id, &s);
+        RP_CRX_TRACE("RETRY STOP clean=%d ok=%d cursor_delta=%x hw=%d",
+                     clean_stop, (int)g_session_good_encodes,
+                     s.cursor >= g_preclear_snapshot.cursor
+                         ? s.cursor - g_preclear_snapshot.cursor : 0xffffffffu,
+                     (int)s.latch);
+    }
+    else
+        RP_CRX_TRACE("RETRY STOP snapshot missing rc=%d", rc);
+    g_retry_state = RP_CRX_RETRY_FINISHED;
+    /* v15: worker enforces the bounded multi-session budget.  A clean
+     * retry does not poison the codec or block other bank IDs; failed
+     * completion keeps the fail-closed poison behavior. */
+    if (!clean_stop || g_session_good_encodes == 0u || rc != 0 ||
+        s.latch != 1u || s.hw_active != 0u ||
+        s.cursor < g_preclear_snapshot.cursor)
+    {
+        g_poisoned = 1u;
+        g_stats.poisoned = 1u;
+    }
+    rp_crx_barrier();
+    RP_CRX_TRACE("RETRY FINISHED clean=%d poison=%d; one latch write consumed",
+                 clean_stop, (int)g_poisoned);
+}
+
+/* v15 passive bank/arena snapshots. No calls to Canon CRX machinery.
+ * Short records avoid the RP DryosDebugMsg %u formatter pitfall. */
+static const uint32_t g_watch_ids[] = {0u,1u,2u,8u,9u,16u,17u};
+
+void raw_vid_rp_crx_observe_banks(const char *phase, uint32_t session_num)
+{
+    uint32_t mgr = *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    uint32_t backend = *(volatile uint32_t *)(uintptr_t)RP_CRX_BACKEND_SLOT;
+    if (!rp_crx_ram_ptr(mgr) || !rp_crx_ram_ptr(backend))
+    {
+        RP_CRX_TRACE("V15 %s seq=%d unavailable mgr=%x backend=%x",
+                     phase, (int)session_num, mgr, backend);
+        return;
+    }
+    for (unsigned i = 0; i < sizeof(g_watch_ids)/sizeof(g_watch_ids[0]); i++)
+    {
+        struct rp_crx_bank_snapshot snap;
+        uint32_t id = g_watch_ids[i];
+        if (rp_crx_bank_snapshot(mgr, id, &snap) != 0 ||
+            !rp_crx_snapshot_arena_valid(&snap))
+            continue;
+        RP_CRX_TRACE("V15 %s seq=%d id=%d l=%d hw=%d cur=%x",
+                     phase, (int)session_num, (int)id,
+                     (int)snap.latch, (int)snap.hw_active, snap.cursor);
+        RP_CRX_TRACE("V15 %s id=%d ptr=%x,%x,%x,%x,%x",
+                     phase, (int)id,
+                     snap.pointers[0],snap.pointers[1],snap.pointers[2],
+                     snap.pointers[3],snap.pointers[4]);
+    }
+}
+
+void raw_vid_rp_crx_stillwatch_task(void *unused)
+{
+    (void)unused;
+    uint32_t mgr = *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    uint32_t backend = *(volatile uint32_t *)(uintptr_t)RP_CRX_BACKEND_SLOT;
+    struct rp_crx_bank_snapshot prior[7];
+    uint32_t valid[7] = {0};
+    if (!rp_crx_ram_ptr(mgr) || !rp_crx_ram_ptr(backend)) return;
+    RP_CRX_TRACE("STILLWATCH START mgr=%x backend=%x span_ms=120000",mgr,backend);
+    raw_vid_rp_crx_observe_banks("still-baseline",0);
+    for (int tick=0;tick<600;tick++)
+    {
+        msleep(200);
+        if (*(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT != mgr ||
+            *(volatile uint32_t *)(uintptr_t)RP_CRX_BACKEND_SLOT != backend)
+        {
+            RP_CRX_TRACE("STILLWATCH ROOT CHANGED tick=%d: stop reads",tick);
+            break;
+        }
+        for (int i=0;i<7;i++)
+        {
+            struct rp_crx_bank_snapshot curr;
+            if (rp_crx_bank_snapshot(mgr,g_watch_ids[i],&curr) != 0 ||
+                !rp_crx_snapshot_arena_valid(&curr)) continue;
+            int changed = !valid[i] ||
+                curr.latch != prior[i].latch ||
+                curr.hw_active != prior[i].hw_active ||
+                curr.cursor != prior[i].cursor ||
+                memcmp(curr.pointers,prior[i].pointers,sizeof(curr.pointers)) != 0;
+            if (changed)
+            {
+                RP_CRX_TRACE("STILLWATCH t=%d id=%d latch=%d hw=%d cur=%x",
+                             tick*200,(int)g_watch_ids[i],(int)curr.latch,
+                             (int)curr.hw_active,curr.cursor);
+                RP_CRX_TRACE("STILLWATCH id=%d p=%x,%x,%x,%x,%x",
+                             (int)g_watch_ids[i],curr.pointers[0],curr.pointers[1],
+                             curr.pointers[2],curr.pointers[3],curr.pointers[4]);
+                prior[i]=curr;valid[i]=1u;
+            }
+        }
+        if ((tick%50)==49)
+            RP_CRX_TRACE("STILLWATCH alive t=%d",(tick+1)*200);
+    }
+    RP_CRX_TRACE("STILLWATCH END (read-only)");
+}
+
+
+/* -------------------------------------------------------------------------
+ * v17 Canon-only observer. This runs even if the ML recorder was NEVER used.
+ * It does not install hooks, call Canon's CRX functions or modify CRX RAM.
+ * This is best-effort polling, not a synchronized transaction snapshot.
+ * A pointer range check is necessary but not proof of valid mapping; avoid
+ * dereferencing bank contexts until root/mode/arena have been stable for two
+ * samples. Drop transient epochs rather than chasing changed roots.
+ * ------------------------------------------------------------------------- */
+#define RP_NATIVE_WATCH_POLL_MS 50u
+#define RP_NATIVE_BANK_COUNT 7u
+
+struct rp_native_roots
+{
+    uint32_t mgr, backend, mode;
+    uint32_t scratch, scratch_size, base, size, cursor, ctx_base;
+    uint32_t event_queue, resource_first, free_d, free_q;
+    uint32_t latch[RP_CRX_ALGSMGR_LATCH_COUNT];
+};
+
+static int rp_native_get_roots(struct rp_native_roots *r)
+{
+    if (!r) return -1;
+    memset(r, 0, sizeof(*r));
+    r->mgr = *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    r->backend = *(volatile uint32_t *)(uintptr_t)RP_CRX_BACKEND_SLOT;
+    if (!rp_crx_ram_ptr(r->mgr) || !rp_crx_ram_ptr(r->backend))
+        return -2;
+    volatile uint32_t *m = (volatile uint32_t *)(uintptr_t)r->mgr;
+    volatile uint32_t *b = (volatile uint32_t *)(uintptr_t)r->backend;
+    r->mode = m[0x2c / 4];
+    r->scratch = m[0xb8 / 4];
+    r->scratch_size = m[0xbc / 4];
+    r->event_queue = m[0xdc / 4];
+    r->resource_first = m[0xcc / 4];
+    r->free_d = m[0x108 / 4];
+    r->free_q = m[0x10c / 4];
+    r->base = b[0x08 / 4];
+    r->size = b[0x0c / 4];
+    r->cursor = b[0x14 / 4];
+    r->ctx_base = b[0x28 / 4];
+    /* Basic sanity checks for the D arena; Q can transiently have no D
+     * workspace, and its pointers must never be followed in that state. */
+    if (r->mode != RP_CRX_MODE_LOSSLESS && r->mode != RP_CRX_MODE_ALT)
+        return -3;
+    if (!rp_crx_ram_ptr(r->base) || r->size == 0u ||
+        r->size > 0x200000u ||
+        r->base > 0xBFFFFFFFu - r->size)
+        return -4;
+    if (r->mode == RP_CRX_MODE_LOSSLESS &&
+        (r->cursor < r->base || r->cursor > r->base + r->size))
+        return -6;
+    for (unsigned i=0; i<RP_CRX_ALGSMGR_LATCH_COUNT; i++)
+        r->latch[i] = m[(RP_CRX_ALGSMGR_LATCH_OFFSET / 4) + i];
+    if (*(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT != r->mgr ||
+        *(volatile uint32_t *)(uintptr_t)RP_CRX_BACKEND_SLOT != r->backend ||
+        m[RP_CRX_ALGSMGR_MODE_OFFSET / 4] != r->mode)
+        return -5;
+    return 0;
+}
