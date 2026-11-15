@@ -24,3 +24,7 @@
 
 #undef CONFIG_ADDITIONAL_VERSION
 #undef CONFIG_PROP_REQUEST_CHANGE
+
+/* Runtime-validated RAW LV channel-3 pBlock is installed by raw_vidx.
+ * Do not enable generic SRM as a general-purpose allocator. */
+#define CONFIG_RAW_LIVEVIEW
