@@ -3265,6 +3265,7 @@ fail_no_handle:
     raw_vid_request_stop_async();
     return rc;
 }
+
 static void worker(void)
 {
     #ifdef RAW_VID_LOG
@@ -3276,13 +3277,13 @@ static void worker(void)
 
     char mlv_name[20] = {0};
 
-    struct crop_buf crop_bufs[2] = {NULL};
+    struct crop_buf crop_bufs[2] = {{0}};
     struct crop_buf *crop_buf = NULL;
     uint32_t video_frame_count = 0;
 
     char *header_buf = NULL; // space for MLV file header
-    const uint32_t header_buf_size = 1024; // wants to be big enough for combined headers,
-                                           // this file shouldn't know their size, it's okay to just guess.
+    const uint32_t header_buf_size = 8192; /* room for standard metadata plus
+                                            * a future larger exact CRXI/CMP1 */
     uint32_t header_size = 0; // MLV lib returns real size here
     header_buf = malloc(header_buf_size);
     if (header_buf == NULL)
@@ -3324,11 +3325,159 @@ static void worker(void)
                 break;
             }
 
+            /*
+             * RP stages 14..16 isolate READY-task -> queue -> worker from the
+             * actual MLV accumulation path.  Common event cleanup below still
+             * releases capture_slot, so a healthy worker keeps the 3-slot ring
+             * circulating exactly as the full recorder would.
+             */
+            if (is_camera("RP", "1.6.0") &&
+                RP_START_PROBE_STAGE >= 14 && RP_START_PROBE_STAGE <= 16)
+            {
+                rp_worker_probe_frames++;
+
+                if (rp_worker_probe_frames <= 8)
+                {
+                    RP_START_TRACE("P%d worker frame=%d slot=%d src=%x",
+                                   RP_START_PROBE_STAGE,
+                                   (int)rp_worker_probe_frames,
+                                   (int)event->capture_slot,
+                                   (uint32_t)event->src);
+                }
+
+                /* Stage 14 proves posting/consumption/release only. */
+                if (RP_START_PROBE_STAGE == 14)
+                    break;
+
+                /* Stages 15/16 copy one frame only.  Subsequent frames are
+                 * consume/release, so one slow copy cannot become a sustained
+                 * workload and obscure the measured single-frame cost. */
+                if (rp_worker_probe_frames == 1)
+                {
+                    if (crop_bufs[0].start == NULL)
+                    {
+                        RP_START_TRACE("P%d FAIL crop buffer NULL",
+                                       RP_START_PROBE_STAGE);
+                        break;
+                    }
+
+                    const uint32_t line_size_probe = event->w * BPP / 8u;
+                    const uint32_t src_x_bytes_probe = ((event->x + 7u) / 8u) * BPP;
+                    const uint32_t src_y_probe = (event->y / 2u) * 2u;
+                    const uint8_t *src_probe =
+                        (const uint8_t *)UNCACHEABLE(event->src) +
+                        src_y_probe * raw_info.pitch + src_x_bytes_probe;
+                    uint8_t *dst_probe =
+                        (RP_START_PROBE_STAGE == 16)
+                        ? (uint8_t *)CACHEABLE(crop_bufs[0].start)
+                        : (uint8_t *)UNCACHEABLE(crop_bufs[0].start);
+
+                    RP_START_TRACE("P%d copy begin src=%x dst=%x bytes=%d",
+                                   RP_START_PROBE_STAGE,
+                                   (uint32_t)src_probe, (uint32_t)dst_probe,
+                                   (int)(line_size_probe * event->h));
+
+                    uint64_t copy_t0 = (uint64_t)get_us_clock();
+                    for (uint32_t line = 0; line < event->h; line++)
+                    {
+                        memcpy(dst_probe + line * line_size_probe,
+                               src_probe + line * raw_info.pitch,
+                               line_size_probe);
+                    }
+                    uint64_t copy_dt = (uint64_t)get_us_clock() - copy_t0;
+
+                    /* Stage 16 dirties a cacheable alias but does not pass it
+                     * through FIO_WriteFile().  Clean only the probe range.
+                     * Do not use sync_caches(): it is not exported to modules on RP. */
+                    if (RP_START_PROBE_STAGE == 16)
+                        dcache_clean((uint32_t)dst_probe,
+                                     line_size_probe * event->h);
+
+                    RP_START_TRACE("P%d copy done us=%d",
+                                   RP_START_PROBE_STAGE, (int)copy_dt);
+                }
+
+                break;
+            }
+
+            /* Stage 32 is the first integration of the proven RP ch3 capture
+             * ring with the proven RD46/WR13 rectangle engine.  Process one
+             * real frame only; any IMAGE_DATA already queued before the stop
+             * request is consumed/released without creating another VIDF. */
+            if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 32)
+            {
+                rp_worker_probe_frames++;
+                if (rp_worker_probe_frames > 1)
+                {
+                    RP_START_TRACE("S32 extra frame consume slot=%d",
+                                   (int)event->capture_slot);
+                    break;
+                }
+                RP_START_TRACE("S32 real RAW frame slot=%d src=%x pitch=%d crop=%d,%d %dx%d",
+                               (int)event->capture_slot, (uint32_t)event->src,
+                               raw_info.pitch, (int)event->x, (int)event->y,
+                               (int)event->w, (int)event->h);
+            }
+
+            if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 33 &&
+                rp_worker_m2m_failed)
+            {
+                /* A failed transfer already requested COMMAND_STOP.  Consume
+                 * any IMAGE_DATA that was queued ahead of it without creating
+                 * more VIDF blocks or touching the mem2mem engine again. */
+                break;
+            }
+
             #ifdef RAW_VID_LOG
             snprintf(log_buf, buf_size, "Image prod time, cons time, size: %d, %d, %d\n",
                      event->creation_time, get_ms_clock(), event->size);
             send_log_data_str(log_buf);
             #endif
+
+            /* v3C output backend: one independently reclaimable frame slot
+             * per completed RP crop.  Keep the entire source-ring / true
+             * Complete frontend and transient RP M2M path unchanged. */
+            if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 36)
+            {
+                if (raw_vid_codec_is_crx(rp_record_codec))
+                {
+                    /* After the frozen safety limit is reached, consume any
+                     * IMAGE_DATA already queued ahead of COMMAND_STOP.  The
+                     * common cleanup below still returns its capture slot. */
+                    if (rp_crx_frame_limit && video_frame_count >= rp_crx_frame_limit)
+                    {
+                        RP_START_TRACE("CRX limit drain slot=%d frame=%d limit=%d",
+                                       (int)event->capture_slot, (int)video_frame_count,
+                                       (int)rp_crx_frame_limit);
+                        break;
+                    }
+
+                    int crx_rc = rp_process_crx_frame_slot(
+                        event, &video_frame_count,
+                        header_buf, header_buf_size, &header_size);
+                    if (!crx_rc && rp_still_session_active)
+                        raw_vid_still_session_frame_seen(video_frame_count);
+                    if (!crx_rc && rp_crx_frame_limit &&
+                        video_frame_count >= rp_crx_frame_limit)
+                    {
+                        raw_vid_rp_request_stop();
+                        if (rp_still_session_active)
+                            raw_vid_still_session_stop_once();
+                        else
+                            raw_vid_request_stop_async();
+                    }
+                }
+                else
+                {
+                    int w3_rc = rp_process_frame_slot(event, &video_frame_count);
+                    if (rp_w3_matrix_case_active() && !w3_rc)
+                        rp_w3_matrix_on_frame(video_frame_count, event->capture_slot,
+                                              get_us_clock());
+                    if (!w3_rc && rp_still_session_active)
+                        raw_vid_still_session_frame_seen(video_frame_count);
+                }
+                break;
+            }
 
             if (crop_buf == NULL)
             {
@@ -3354,6 +3503,7 @@ static void worker(void)
             // before triggering flush to disk.
 
             char *dst = NULL;
+            char *frame_begin = crop_buf->cur;
             struct crop_buf *flush_src = NULL;
             // write the header of a vidf block, which returns us an aligned
             // location to write the image data.
@@ -3376,14 +3526,23 @@ static void worker(void)
 
                 if (crop_buf->cur != crop_buf->start)
                 {
-                    // raw_write() can reset these, presumably we're writing too fast
-                    // so it's not finished.
                     SEND_LOG_DATA_STR("After buf swap, buf was in use; not written out\n");
-                    crop_buf = NULL; // Hack, prevents next IMAGE_DATA doing anything,
-                                     // really we should flush the remaining?
-                    break; // FIXME we should stop as well
+                    if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 36)
+                    {
+                        RP_START_TRACE("S36 BUF STARVE writing=%d used=%d cap=%d wr_q=%d wr_done=%d",
+                                       crop_buf->writing,
+                                       (int)(crop_buf->cur - crop_buf->start),
+                                       (int)(crop_buf->end - crop_buf->start),
+                                       (int)rp_writer_jobs_queued,
+                                       (int)rp_writer_jobs_done);
+                        raw_vid_rp_request_stop();
+                        raw_vid_request_stop_async();
+                    }
+                    crop_buf = NULL;
+                    break;
                 }
 
+                frame_begin = crop_buf->cur;
                 dst = write_video_frame_header(event->size, crop_buf->cur, crop_buf->end);
                 if (dst == NULL)
                 {
@@ -3414,6 +3573,9 @@ static void worker(void)
             // as we have edmac_sem, so we can safely flush if one of the buffers was full.
             if (flush_src != NULL)
             {
+                /* RP stage36 v3C exits through rp_process_frame_slot() above,
+                 * so this is now the legacy accumulation-buffer path only. */
+                flush_src->writing = 1;
                 task_create("raw_write", WORKER_WRITE_PRIO, 0x800,
                             write_buf_to_disk, flush_src);
             }
@@ -3437,22 +3599,175 @@ static void worker(void)
             // The extra cost for doing a memcpy() to align should be tiny,
             // alignment requirement is 0x10 on Digic 5.
 
-            edmac_copy_rectangle_cbr_start(
-                (void*)dst, event->src,
-                raw_info.pitch, (event->x + 7)/8*BPP, event->y/2*2,
-                line_size, 0, 0,
-                line_size, event->h,
-                &edmac_cbr_r, &edmac_cbr_w, NULL
-            );
-            // edmac_cbr_w() will release edmac sem, when copy complete
+            /*
+             * EOS RP / DIGIC 8 MVP path.
+             *
+             * Do not leave even dead runtime references to the generic
+             * edmac_copy_rectangle_* helpers in this module: RP does not
+             * provide CONFIG_EDMAC_MEMCPY, so TCC would reject raw_vidx.mo
+             * at load time before is_camera() could select this branch.
+             *
+             * Copy only the requested packed-14 rectangle synchronously
+             * from the uncached full-frame source.  The full-frame source is
+             * released back to the RP capture ring only after this function
+             * returns from RAW_DATA handling.
+             */
+            if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 32)
+            {
+                uint32_t m2m_us = 0;
+                int m2m_rc = raw_vid_rp_m2m_crop_once(
+                    event->src, raw_info.pitch,
+                    event->x, event->y, event->w, event->h,
+                    dst, (uint32_t)event->size, &m2m_us);
+
+                give_semaphore(edmac_sem);
+
+                if (m2m_rc)
+                {
+                    /* Do not flush a VIDF whose payload DMA failed. */
+                    crop_buf->cur = frame_begin;
+                    if (video_frame_count > 0)
+                        video_frame_count--;
+                    RP_START_TRACE("S32 real crop FAIL rc=%d us=%d",
+                                   m2m_rc, (int)m2m_us);
+                }
+                else
+                {
+                    RP_START_TRACE("S32 real crop PASS us=%d dst=%x bytes=%d",
+                                   (int)m2m_us, (uint32_t)dst, event->size);
+                }
+
+                /* Stop assignment before releasing this source slot.  This
+                 * serializes with READY posting, so at most an already-posted
+                 * IMAGE_DATA can precede the asynchronous COMMAND_STOP. */
+                raw_vid_rp_request_stop();
+                raw_vid_request_stop_async();
+                break;
+            }
+
+            /* Stage 33..36:
+             *  - S33 keeps RP Esub1 resources/power owned for the session.
+             *  - S34 uses the proven one-shot transaction per frame.
+             *  - S35 is the rejected phase-guard experiment.
+             *  - S36 returns to S34 transient M2M and changes only raw_write
+             *    task priority (0x9 -> 0x11). */
+            if (is_camera("RP", "1.6.0") &&
+                (RP_START_PROBE_STAGE == 33 || RP_START_PROBE_STAGE == 34 ||
+                 RP_START_PROBE_STAGE == 35 || RP_START_PROBE_STAGE == 36))
+            {
+                uint32_t m2m_us = 0;
+                int m2m_rc;
+
+                if (RP_START_PROBE_STAGE == 33)
+                {
+                    m2m_rc = raw_vid_rp_m2m_crop_frame(
+                        event->src, raw_info.pitch,
+                        event->x, event->y, event->w, event->h,
+                        dst, (uint32_t)event->size, &m2m_us);
+                }
+                else
+                {
+                    m2m_rc = raw_vid_rp_m2m_crop_once(
+                        event->src, raw_info.pitch,
+                        event->x, event->y, event->w, event->h,
+                        dst, (uint32_t)event->size, &m2m_us);
+                }
+
+                if (!m2m_rc && RP_START_PROBE_STAGE == 35)
+                    rp_last_m2m_complete_us = get_us_clock();
+
+                give_semaphore(edmac_sem);
+
+                if (m2m_rc)
+                {
+                    /* Roll back the not-yet-flushed VIDF and stop cleanly. */
+                    crop_buf->cur = frame_begin;
+                    if (video_frame_count > 0)
+                        video_frame_count--;
+                    RP_START_TRACE("S%d real crop FAIL rc=%d us=%d frame=%d",
+                                   RP_START_PROBE_STAGE, m2m_rc, (int)m2m_us,
+                                   (int)video_frame_count);
+                    rp_worker_m2m_failed = 1;
+                    if (RP_START_PROBE_STAGE == 33)
+                        raw_vid_rp_m2m_session_stop();
+                    raw_vid_rp_request_stop();
+                    raw_vid_request_stop_async();
+                }
+
+                break;
+            }
+
+            const uint32_t src_x_bytes = ((event->x + 7) / 8) * BPP;
+            const uint32_t src_y = (event->y / 2) * 2;
+            const uint8_t *src = (const uint8_t *)UNCACHEABLE(event->src)
+                               + src_y * raw_info.pitch + src_x_bytes;
+            uint8_t *out = (uint8_t *)dst;
+
+            for (uint32_t line = 0; line < event->h; line++)
+            {
+                memcpy(out + line * line_size,
+                       src + line * raw_info.pitch,
+                       line_size);
+            }
+
+            /* Synchronous crop completed; allow the next crop operation. */
+            give_semaphore(edmac_sem);
 
             break;
 
         case COMMAND_START:
             SEND_LOG_DATA_STR("Worker got start request.\n");
-            if (event->w == 0 || event->h == 0)
+            /* Refuse an obsolete Still-LV command if the dial/LV changed
+             * while the request was waiting in the worker queue. */
+            if (event->still_session && !raw_vid_still_mode_ok())
             {
-                SEND_LOG_DATA_STR("ERROR: start request with 0 area\n");
+                RP_START_TRACE("STILL reject at worker entry: lv/mode changed");
+                break;
+            }
+            /* v23.2: native CRX/C-RAW has one production allocator policy only:
+             * first-free compatible D-slot + guarded latch clear / exact-tail
+             * cursor rewind after a clean STOP. No runtime selector exists. */
+            if (raw_vid_codec_is_crx(event->codec_mode))
+            {
+                if (RP_START_PROBE_STAGE != 36)
+                {
+                    RP_START_TRACE("V23.2 CRX requires stage36");
+                    break;
+                }
+                RP_START_TRACE("V23.2 DYNAMIC c=%d b=%d",
+                               event->codec_mode,event->requested_bpp);
+            }
+
+            if (event->codec_mode == RAW_VID_CODEC_CRAW)
+            {
+                if ((event->requested_bpp != 10 &&
+                     event->requested_bpp != 12 &&
+                     event->requested_bpp != 14) ||
+                    event->resolution_mode < RAW_VID_RES_720P ||
+                    event->resolution_mode > RAW_VID_RES_W3_WIDE_720)
+                {
+                    RP_START_TRACE("CRAW DIRECT GATE reject bpp=%d res=%d limit=%d",
+                                   event->requested_bpp, event->resolution_mode,
+                                   event->crx_frame_limit);
+                    SEND_LOG_DATA_STR("ERROR: C-RAW requires supported BPP/resolution direct-W3\n");
+                    break;
+                }
+                RP_START_TRACE("CRAW DIRECT GATE PASS bpp=%d res=%d limit=%d",
+                               event->requested_bpp, event->resolution_mode,
+                               event->crx_frame_limit);
+            }
+            if (is_camera("RP", "1.6.0") &&
+                (event->resolution_mode < RAW_VID_RES_720P ||
+                 event->resolution_mode > RAW_VID_RES_W3_WIDE_720))
+            {
+                SEND_LOG_DATA_STR("ERROR: start request with invalid resolution mode\n");
+                break;
+            }
+            if (is_camera("RP", "1.6.0") &&
+                (event->codec_mode < RAW_VID_CODEC_RAW ||
+                 event->codec_mode > RAW_VID_CODEC_CRAW))
+            {
+                SEND_LOG_DATA_STR("ERROR: start request with invalid codec mode\n");
                 break;
             }
 
