@@ -903,3 +903,286 @@ static int rp_crx_multi_after_stop(uint32_t bits, uint32_t id,
     rp_crx_log_snapshot("v16-postclear-preimage", id, &s);
     return 0;
 }
+
+int raw_vid_rp_crx_retry_state(void) { return (int)g_retry_state; }
+int raw_vid_rp_crx_retry_bits(void) { return (int)g_retry_bits; }
+
+void raw_vid_rp_crx_request_reclaim(void)
+{
+    g_reclaim_requested = 1u;
+    rp_crx_barrier();
+}
+
+static int rp_crx_v22_snapshot_matches_tail(const struct rp_crx_bank_snapshot *now)
+{
+    if (!now || !g_reclaim_candidate_valid || !g_route_valid)
+        return 0;
+    const struct rp_crx_bank_snapshot *pre = &g_reclaim_pre;
+    const struct rp_crx_bank_snapshot *tail = &g_reclaim_tail;
+    if (!rp_crx_snapshot_arena_valid(now) ||
+        *(volatile uint32_t *)(uintptr_t)
+            (g_session_manager + RP_CRX_ALGSMGR_TIMER_OFFSET) != RP_CRX_TIMER_IDLE_SENTINEL ||
+        now->backend != pre->backend || now->backend != tail->backend ||
+        now->arena_base != pre->arena_base || now->arena_base != tail->arena_base ||
+        now->arena_size != pre->arena_size || now->arena_size != tail->arena_size ||
+        now->context != pre->context || now->context != tail->context ||
+        now->mode != RP_CRX_MODE_LOSSLESS ||
+        now->cursor != tail->cursor || tail->cursor <= pre->cursor ||
+        now->latch != 1u || now->hw_active != 0u)
+        return 0;
+    for (uint32_t i = 0u; i < 5u; i++)
+    {
+        if (now->pointers[i] != tail->pointers[i])
+            return 0;
+        /* Every persistent workspace base captured after our fresh init must
+         * lie inside the allocation interval being reclaimed. */
+        if (tail->pointers[i] < pre->cursor || tail->pointers[i] >= tail->cursor)
+            return 0;
+    }
+    return 1;
+}
+
+/* Guarded transaction.  path=1 runs after OUR final event-4 handler has
+ * returned in the AlgsMgr task; path=2 is the worker fallback after all own
+ * event-4 returns have been observed.  The LOW allocator semaphore prevents
+ * a concurrent D_ALLOC cursor writer during the actual mutation. */
+static void rp_crx_v22_record_reclaim(int rc, uint32_t path)
+{
+    g_reclaim_attempted = 1u;
+    g_reclaim_last_rc = rc;
+    g_reclaim_last_path = path;
+    g_stats.reclaim_attempts++;
+    g_stats.reclaim_last_rc = rc;
+    g_stats.reclaim_last_path = path;
+    g_stats.reclaim_route_type = g_route_type;
+    g_stats.reclaim_route_id = g_route_id;
+    if (rc != 0 && g_reclaim_write_started)
+    {
+        g_poisoned = 1u;
+        g_stats.poisoned = 1u;
+    }
+    rp_crx_barrier();
+}
+
+static int rp_crx_v22_try_reclaim(uint32_t path)
+{
+    int rc = -90;
+    if (g_reclaim_in_progress)
+        return -108;
+    if (g_reclaim_attempted)
+        return g_reclaim_last_rc;
+
+    /* Once the final manager-boundary attempt has observed a hard mismatch,
+     * do not retry later merely because the bump cursor happens to equal the
+     * old numerical value again (ABA).  Only LOW-semaphore contention is a
+     * retryable path-1 condition. */
+    if (!g_reclaim_requested || !g_reclaim_candidate_valid || !g_route_valid)
+    {
+        rc = -91;
+        rp_crx_v22_record_reclaim(rc, path);
+        return rc;
+    }
+    if (g_active || g_free_pending || g_free_callback_errors ||
+        g_stats.unexpected_callbacks || g_poisoned ||
+        g_route_id >= RP_CRX_ALGSMGR_LATCH_COUNT)
+    {
+        rc = -92;
+        rp_crx_v22_record_reclaim(rc, path);
+        return rc;
+    }
+    if (g_session_multi_bits || g_session_good_encodes == 0u)
+    {
+        rc = -93;
+        rp_crx_v22_record_reclaim(rc, path);
+        return rc;
+    }
+
+    uint32_t manager = *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    struct rp_crx_bank_snapshot before;
+    if (manager != g_session_manager ||
+        rp_crx_bank_snapshot(manager, g_route_id, &before) != 0 ||
+        !rp_crx_v22_snapshot_matches_tail(&before))
+    {
+        rc = -94;
+        rp_crx_v22_record_reclaim(rc, path);
+        return rc;
+    }
+
+    uint32_t low_sem = *(volatile uint32_t *)(uintptr_t)RP_CRX_LOW_ALLOC_SEM_SLOT;
+    if (low_sem == 0u)
+    {
+        rc = -95;
+        rp_crx_v22_record_reclaim(rc, path);
+        return rc;
+    }
+    if (take_semaphore_now((struct semaphore *)(uintptr_t)low_sem) != 0)
+    {
+        /* At the manager post-event boundary a busy LOW allocator can settle
+         * before worker end_session; permit exactly that one fallback retry.
+         * A worker-side failure is terminal for this session. */
+        rc = -96;
+        if (path != 1u)
+            rp_crx_v22_record_reclaim(rc, path);
+        return rc;
+    }
+
+    g_reclaim_in_progress = 1u;
+    rp_crx_barrier();
+    rc = -97;
+
+    /* Re-read everything while holding exactly the semaphore used by
+     * LOW_D_ALLOC.  Do not trust the pre-lock observation. */
+    struct rp_crx_bank_snapshot locked;
+    manager = *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    if (manager != g_session_manager ||
+        rp_crx_bank_snapshot(manager, g_route_id, &locked) != 0 ||
+        !rp_crx_v22_snapshot_matches_tail(&locked))
+        goto out_unlock;
+
+    volatile uint32_t *latch = (volatile uint32_t *)(uintptr_t)
+        (manager + RP_CRX_ALGSMGR_LATCH_OFFSET + g_route_id * 4u);
+    volatile uint32_t *cursor = (volatile uint32_t *)(uintptr_t)
+        (locked.backend + 0x14u);
+
+    /* Safer partial-failure order: clear the init latch first.  If anything
+     * fails before cursor rewind, Canon will reinitialize on the next use but
+     * the old tail remains reserved.  Cursor-first with latch=1 could expose
+     * live stale pointers to a newly reused allocation. */
+    g_reclaim_write_started = 1u;
+    *latch = 0u;
+    rp_crx_barrier();
+    if (*latch != 0u || *cursor != locked.cursor ||
+        *(volatile uint32_t *)(uintptr_t)RP_CRX_BACKEND_SLOT != locked.backend ||
+        *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT != manager ||
+        *(volatile uint32_t *)(uintptr_t)(manager + RP_CRX_ALGSMGR_MODE_OFFSET) != RP_CRX_MODE_LOSSLESS ||
+        *(volatile uint32_t *)(uintptr_t)(manager + RP_CRX_ALGSMGR_TIMER_OFFSET) != RP_CRX_TIMER_IDLE_SENTINEL)
+    {
+        rc = -98;
+        goto out_unlock;
+    }
+
+    *cursor = g_reclaim_pre.cursor;
+    rp_crx_barrier();
+    if (*cursor != g_reclaim_pre.cursor || *latch != 0u)
+    {
+        rc = -99;
+        goto out_unlock;
+    }
+
+    g_encoder_bank_bits[g_route_id] = 0u;
+    g_bank_first_width[g_route_id] = 0u;
+    g_bank_first_height[g_route_id] = 0u;
+    g_encoder_latched_bits = 0u;
+    g_reclaim_candidate_valid = 0u;
+    g_stats.reclaim_successes++;
+    rc = 0;
+
+out_unlock:
+    give_semaphore((struct semaphore *)(uintptr_t)low_sem);
+    g_reclaim_in_progress = 0u;
+    rp_crx_barrier();
+    rp_crx_v22_record_reclaim(rc, path);
+    return rc;
+}
+
+static uint32_t rp_crx_session_state_cb(uint32_t a0, uint32_t a1,
+                                        uint32_t a2, uint32_t a3, uint32_t a4)
+{
+    uint32_t orig = g_session_state_orig_cb;
+    uint32_t is_our_free = 0u;
+
+    /* The event-4 payload is {handle, callback, opaque}.  Identify ours before
+     * Canon frees that payload; do not rely on counts of unrelated Canon
+     * FreeEncBuffer events. */
+    if (a2 == 4u && a4 == 0x0cu && rp_crx_ram_ptr(a3))
+    {
+        volatile uint32_t *payload = (volatile uint32_t *)(uintptr_t)a3;
+        if (payload[1] == (uint32_t)(uintptr_t)&rp_crx_free_complete_cb)
+            is_our_free = 1u;
+    }
+
+    g_session_state_hits++;
+    rp_crx_barrier();
+    uint32_t rc = orig ? ((rp_crx_state_cb_fn)(uintptr_t)orig)(a0,a1,a2,a3,a4) : 7u;
+
+    if (a2 == 4u)
+        g_session_state_event4++;
+    if (is_our_free)
+    {
+        if (g_reclaim_requested && g_free_pending == 0u && !g_active &&
+            !g_reclaim_attempted)
+            (void)rp_crx_v22_try_reclaim(1u);
+        /* Publish post-handler completion only after a possible manager-path
+         * reclaim has completed, so worker fallback cannot race the write. */
+        g_free_post_completed++;
+        rp_crx_barrier();
+    }
+    rp_crx_barrier();
+    return rc;
+}
+
+static int rp_crx_v22_install_state_wrapper(void)
+{
+    uint32_t manager = *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    if (!rp_crx_ram_ptr(manager) || manager != g_session_manager || g_state_probe_armed)
+        return -100;
+    uint32_t state = *(volatile uint32_t *)(uintptr_t)(manager + 0x0cu);
+    if (!rp_crx_ram_ptr(state))
+        return -101;
+    volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)state;
+    uint32_t orig = st[3];
+    uint32_t hook = (uint32_t)(uintptr_t)&rp_crx_session_state_cb;
+    if (!orig || orig == hook || g_session_state_installed)
+        return -102;
+    g_session_state = state;
+    g_session_state_orig_cb = orig;
+    g_session_state_hits = 0u;
+    g_session_state_event4 = 0u;
+    g_free_post_completed = 0u;
+    rp_crx_barrier();
+    st[3] = hook;
+    rp_crx_barrier();
+    if (st[3] != hook)
+    {
+        g_session_state = 0u;
+        g_session_state_orig_cb = 0u;
+        return -103;
+    }
+    g_session_state_installed = 1u;
+    rp_crx_barrier();
+    return 0;
+}
+
+static int rp_crx_v22_restore_state_wrapper(void)
+{
+    if (!g_session_state_installed)
+        return 0;
+    if (!rp_crx_ram_ptr(g_session_state) || !g_session_state_orig_cb)
+        return -104;
+    volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)g_session_state;
+    uint32_t hook = (uint32_t)(uintptr_t)&rp_crx_session_state_cb;
+    if (st[3] != hook)
+        return -105;
+    st[3] = g_session_state_orig_cb;
+    rp_crx_barrier();
+    if (st[3] != g_session_state_orig_cb)
+        return -106;
+    g_session_state_installed = 0u;
+    g_session_state = 0u;
+    g_session_state_orig_cb = 0u;
+    rp_crx_barrier();
+    return 0;
+}
+
+static int rp_crx_v22_wait_post_free(uint32_t target)
+{
+    uint32_t t0 = get_us_clock();
+    while (g_free_post_completed < target)
+    {
+        if ((uint32_t)(get_us_clock() - t0) >= RP_CRX_FREE_TIMEOUT_US)
+            return -107;
+        msleep(1);
+        rp_crx_barrier();
+    }
+    return 0;
+}
