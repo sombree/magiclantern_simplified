@@ -42,18 +42,30 @@ struct mlv_session
     int fps;
     int res_x;
     int res_y;
+    int bits_per_pixel;
+    int wire_bits_per_pixel; /* 0=sample (legacy), 16=LE16 VIDF */
     int crop_offset_x;
     int crop_offset_y;
     int pan_offset_x;
     int pan_offset_y;
     uint32_t image_data_alignment;
+    int native_crx;
 };
 
 int start_mlv_session(struct mlv_session *session);
 int stop_mlv_session(void);
 
 int write_file_headers(char *start, char *end);
+int write_file_headers_crx_v2(char *start, char *end,
+                              const void *cmp1, uint32_t cmp1_size,
+                              int32_t value_shift);
 char *write_video_frame_header(uint32_t image_size, char *buf_start, char *buf_end);
+char *write_video_frame_header_padded(uint32_t image_size, uint32_t block_size,
+                                      char *buf_start, char *buf_end);
+char *write_video_frame_header_crx_v2(uint32_t image_size,
+                                      char *buf_start, char *buf_end,
+                                      uint32_t *block_size_out);
 int update_video_frame_count(uint32_t count, char *start, char *end);
+uint64_t mlv_get_session_timestamp(void);
 
 #endif
