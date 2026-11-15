@@ -513,3 +513,410 @@ static int w3m_case_ok(void)
         return 0;
     return 1;
 }
+
+/* v4 diagnostic: emulate the proven manual Single-to-Single transition.
+ * STOP already drains and closes its MLV; caller checked writer.idle.
+ * Avoid 10-Hz queue polling, persistent preflight traffic, and any MMIO
+ * after raw_lv_release(). A passive wait does NOT guarantee Canon teardown;
+ * it intentionally changes only the inter-session orchestration path.
+ * START worker still performs its ordinary preflight and fail-closed guards. */
+static int w3m_wait_inter_session_ready(void)
+{
+    char b[160];
+    snprintf(b,sizeof(b),
+        "INTERCASE PASSIVE_BEGIN ms=%d no_poll=1 no_preflight=1\n",
+        (int)W3M_INTERCASE_COOLDOWN_MS);
+    w3m_text(b);
+    W3M_LOG("INTERCASE PASSIVE_BEGIN ms=%d", (int)W3M_INTERCASE_COOLDOWN_MS);
+    msleep(W3M_INTERCASE_COOLDOWN_MS);
+    if (g_abort || !lv || get_recording_state()!=INACTIVE)
+    {
+        snprintf(b,sizeof(b),"INTERCASE PASSIVE_FAIL lv=%d state=%d abort=%d\n",
+                 (int)lv,(int)get_recording_state(),(int)g_abort);
+        w3m_text(b);
+        return -1;
+    }
+    /* One final writer check; unlike the v3 10-Hz loop this does not
+     * continuously exercise DryOS message-queue internals between sessions. */
+    struct raw_vid_rp_writer_status st;
+    raw_vid_rp_writer_get_status(&st);
+    snprintf(b,sizeof(b),
+        "INTERCASE PASSIVE_END writer_idle=%d queued=%d done=%d q=%d file=%d io=%d post=%d\n",
+        st.idle,(int)st.queued,(int)st.done,(int)st.queue_depth,
+        st.file_open,(int)st.io_fail,(int)st.post_fail);
+    w3m_text(b);
+    W3M_LOG("INTERCASE PASSIVE_END idle=%d", st.idle);
+    return st.idle ? 0 : -2;
+}
+static void w3m_runner(void *unused)
+{
+    (void)unused;
+    int failed=0;
+    char name[24]={0},b[512];
+    uint32_t first=0,status=0;
+    const int run_limit = g_pair_only ? 2 :
+                          g_single_case >= 0 ? W3M_CASES : W3M_LEGACY_CASES;
+    if (g_single_case < 0 && (w3m_state_load(&first,&status) ||
+        (g_no_restart && first != 0u) ||
+        (status!=W3M_READY && status!=W3M_NEEDS_REBOOT) ||
+        first >= (uint32_t)run_limit))
+    {
+        W3M_LOG("REFUSE state not restartable file=%s; inspect/archive it on PC", w3m_state_filename());
+        g_interlock=1;g_running=0;return;
+    }
+    if (g_single_case >= 0) first=(uint32_t)g_single_case;
+    if (get_numbered_file_name((g_single_case >= 0 ?
+            "w3s%02d.txt" :
+                     g_pair_only ? "w3p%02d.txt" :
+                     g_no_restart ? "w3a%02d.txt" : "w3m%02d.txt"),99,name,sizeof(name)) < 0)
+    { W3M_LOG("ABORT no log filename");g_interlock=1;g_running=0;return; }
+    g_log=FIO_CreateFile(name);
+    if (!g_log) { W3M_LOG("ABORT log open name=%s",name);g_interlock=1;g_running=0;return; }
+    g_log_error=0;
+    snprintf(b,sizeof(b),"W3MAT v10; EOS RP 1.6.0; source raw_vidx v22.0; log=%s\n"
+      "EXPERIMENTAL/UNTESTED: 20 legacy + 29 Single-only; max 500ms/12 frames; "
+      "W3 physical transport uncompressed MLV. Values are runtime, not ROM.\n",name);
+    w3m_text(b);
+    W3M_LOG("BEGIN log=%s first=%d cases=%d no_restart=%d",
+            name,(int)first,run_limit,g_no_restart);
+    snprintf(b,sizeof(b),"STATE first_case=%d resume_status=%d state_file=%s no_restart=%d single=%d\n",
+             (int)first,(int)status,w3m_state_filename(),(int)g_no_restart,(int)g_single_case);
+    w3m_text(b);
+    int checkpoint=0;
+    for (int i=(int)first;i<(g_single_case >= 0 ? (int)first+1 : run_limit);++i)
+    {
+        if (g_abort || !lv || get_recording_state()!=INACTIVE)
+        { failed=-1; break; }
+        /* Conservative remaining-card-space gate, re-evaluated per test.
+         * 16k units of 32 KiB = 512 MiB, intentionally ample headroom
+         * beyond the ~54 MB expected for 12 RAW14 frames.
+         * 0 denotes unavailable/unknown information, not zero bytes. */
+        const struct card_info *card=get_shooting_card();
+        int free32=card?get_free_space_32k(card):0;
+        if (free32<=0)
+            W3M_LOG("WARN free-space measurement unknown; do not rely on card capacity gate");
+        if (free32>0 && free32<16384)
+        { failed=-70;W3M_LOG("ABORT LOW CARD FREE units32k=%d",free32);break; }
+        const struct w3m_case *c=&w3m_cases[i];
+        /* b0=1 potentially changes the payload to 16-bit words. Require
+         * explicit Single test until guard measurements validate the bound. */
+        if (c->field==0 && c->value==1 && g_single_case<0)
+        {
+            failed=-72;
+            w3m_text("ABORT B0=1: use explicit SINGLE guarded trial (C01/E01); no ALL until source span is verified\n");
+            W3M_LOG("ABORT b0=1 requires SINGLE case=%s",c->id);
+            break;
+        }
+        /* Crash or battery removal during a run leaves INPROGRESS, not
+         * a false PASS. Never skip unknown hardware failure automatically. */
+        if (g_single_case < 0 && w3m_state_store((uint32_t)i,W3M_INPROGRESS))
+        { failed=-90; W3M_LOG("ABORT checkpoint write failed");break; }
+        g_index=i;
+        g_apply_rc=-999; g_restore_rc=-999;g_stop_clean=-999;
+        g_stop_transfer_rc=-999;g_stop_drain_rc=-999;g_stop_frame_count=0;
+        g_writer_io=0;g_writer_post=0;g_frames=0;
+        g_wireplan_valid=0;
+        memset(&g_wireplan,0,sizeof(g_wireplan));
+        g_has_mid=0;g_has_last=0;
+        g_stage_count=0;g_stage_read=0;
+        memset(g_meta,0,sizeof(g_meta));
+        memset(&g_pre,0,sizeof(g_pre));
+        memset(&g_applied,0,sizeof(g_applied));
+        memset(&g_armed,0,sizeof(g_armed));
+        memset(&g_during_end,0,sizeof(g_during_end));
+        memset(&g_before_off,0,sizeof(g_before_off));
+        memset(&g_restored,0,sizeof(g_restored));
+        g_video_name[0]=0;
+        snprintf(b,sizeof(b),"\nRUN_BEGIN %s ordinal=%d/%d bpp=%d linear=%d field=%d value=%d unknown=%d\n",
+                 c->id,i+1,run_limit,c->bpp,c->linear,c->field,c->value,c->unknown);
+        w3m_text(b);
+        W3M_LOG("RUN_BEGIN id=%s no=%d/%d bpp=%d linear=%d field=%d value=%d",
+                c->id,i+1,run_limit,c->bpp,c->linear,c->field,c->value);
+        w3m_text("STAGE ARM_REQUEST (scheduler posting COMMAND_START)\n");
+        int start_rc=rp_w3_matrix_send_start(c->bpp);
+        w3m_stage_drain();
+        if (start_rc)
+        { failed=-100+start_rc; W3M_LOG("START POST FAIL id=%s rc=%d",c->id,start_rc); break; }
+        uint32_t t0=now_ms();
+        while (get_recording_state()!=ACTIVE && elapsed_ms(t0)<W3M_WAIT_START_MS)
+        {
+            if (g_abort) break;
+            w3m_stage_drain();
+            msleep(20);
+        }
+        w3m_stage_drain();
+        if (get_recording_state()!=ACTIVE)
+        {
+            /* Unknown partial start ownership: do NOT auto-start another case. */
+            failed=-110;
+            if (get_recording_state()==ACTIVE) raw_vid_request_stop_async();
+            W3M_LOG("ABORT start timeout id=%s apply=%d",c->id,g_apply_rc);
+            w3m_text("ABORT START TIMEOUT: manual cold boot required\n");
+            break;
+        }
+        t0=now_ms();
+        W3M_LOG("CAPTURE id=%s target_ms=%d",c->id,W3M_CAPTURE_MS);
+        const int short_trial = (c->field==0 && c->value==1) ||
+                                (g_single_case >= 20 && c->field==4);
+        const uint32_t capture_ms = short_trial ? 180u : W3M_CAPTURE_MS;
+        const uint32_t frame_limit = short_trial ? 4u : W3M_FRAME_SOFT_LIMIT;
+        while (elapsed_ms(t0)<capture_ms && !g_abort)
+        {
+            w3m_stage_drain();
+            if (g_frames >= 6 && !g_has_mid)
+            {
+                raw_vid_rp_matrix_snapshot(&g_mid);
+                g_has_mid=1;
+            }
+            if (g_frames>=frame_limit) break;
+            struct rp_w3_hw_snapshot s;
+            raw_vid_rp_matrix_snapshot(&s);
+            if (s.drops || s.overlap || s.bad_complete || s.post_fail || s.fatal)
+            { failed=-120; break; }
+            msleep(20);
+        }
+        /* Important: capture may have stopped automatically due to a slot
+         * starvation, so STOP must be idempotent at this boundary. */
+        if (get_recording_state()==ACTIVE)
+            raw_vid_request_stop_async();
+        t0=now_ms();
+        /* Wait for both state transition AND worker's STOP acknowledgement.
+         * A stale/missing callback must not be mislabeled as an elapsed timeout. */
+        while ((get_recording_state()!=INACTIVE || g_stop_clean==-999) &&
+               elapsed_ms(t0)<W3M_WAIT_STOP_MS)
+        {
+            w3m_stage_drain();
+            msleep(30);
+        }
+        w3m_stage_drain();
+        if (get_recording_state()!=INACTIVE || g_stop_clean==-999)
+        {
+            failed=-130;
+            W3M_LOG("ABORT stop incomplete id=%s state=%d clean=%d running=%d index=%d elapsed_ms=%d",
+                    c->id,(int)get_recording_state(),g_stop_clean,
+                    (int)g_running,(int)g_index,(int)elapsed_ms(t0));
+            break;
+        }
+        /* As INACTIVE follows drain + MLV close, these represent the actual
+         * finished FIO batch timing of this case (not nominal video rate). */
+        struct raw_vid_rp_writer_status writer;
+        raw_vid_rp_writer_get_status(&writer);
+        snprintf(b,sizeof(b),
+           "FIO queued=%d done=%d q=%d file_open=%d idle=%d pending=%d "
+           "io=%d post=%d batches=%d max_batch_kb=%d max_write_ms=%d "
+           "batch_rate_mb_s_x100=%d\n",
+           (int)writer.queued,(int)writer.done,
+           (int)writer.queue_depth,writer.file_open,writer.idle,
+           (int)writer.header_pending,(int)writer.io_fail,
+           (int)writer.post_fail,(int)writer.batches,
+           (int)(writer.max_batch_bytes/1024u),
+           (int)(writer.max_write_us/1000u),
+           (int)writer.rate_mb_s_x100);
+        w3m_text(b);
+        W3M_LOG("FIO case=%s idle=%d queued=%d done=%d rate=%d.%02d MB/s",
+                c->id,writer.idle,(int)writer.queued,(int)writer.done,
+                (int)(writer.rate_mb_s_x100/100u),
+                (int)(writer.rate_mb_s_x100%100u));
+        if (!writer.idle)
+        {
+            failed=-131;
+            W3M_LOG("ABORT WRITER NOT IDLE after %s",c->id);
+            w3m_text("ABORT WRITER NOT IDLE AFTER STOP; cold boot required\n");
+            break;
+        }
+        /* Snapshot named LAST must be taken before RAW-LV teardown; the
+         * worker captured g_before_off while the MMIO registers were live. */
+        g_last=g_before_off; g_has_last=1;
+        /* No MMIO or raw_info reads after RAW-LV is released. The plan was
+         * snapshotted in task context during the start/arm phases. */
+        if (g_wireplan_valid)
+        {
+            snprintf(b,sizeof(b),
+                "WIREPLAN wh=%d,%d sample_bpp=%d wire_bpp=%d nominal_pitch=%d nominal_bytes=%d target_pitch=%d target_bytes=%d\n",
+                (int)g_wireplan.width,(int)g_wireplan.height,
+                (int)g_wireplan.sample_bpp,(int)g_wireplan.wire_bpp,
+                (int)g_wireplan.nominal_pitch,(int)g_wireplan.nominal_bytes,
+                (int)g_wireplan.target_pitch,(int)g_wireplan.target_bytes);
+            w3m_text(b);
+            snprintf(b,sizeof(b),
+                "WIREBUF observed_pitch=%d source_cap=%d full_hw_at_arm=%d alloc_full=%d status=%s\n",
+                (int)g_wireplan.observed_pitch,(int)g_wireplan.source_capacity,
+                (int)g_wireplan.hw_full_width,(int)g_wireplan.buffer_full_width,
+                "MODEL_ONLY");
+        }
+        else
+            snprintf(b,sizeof(b),"WIREPLAN status=MODEL_UNAVAILABLE\n");
+        w3m_text(b);
+        w3m_snapshot_text("PRE",&g_pre);
+        w3m_snapshot_text("APPLIED",&g_applied);
+        w3m_snapshot_text("ARMED",&g_armed);
+        w3m_snapshot_text("END_BEFORE_RESTORE",&g_during_end);
+        w3m_snapshot_text("AFTER_RESTORE",&g_restored);
+        if (g_has_mid) w3m_snapshot_text("MID",&g_mid);
+        w3m_snapshot_text("LAST_BEFORE_RAW_OFF",&g_last);
+        w3m_delta_text("PRE_TO_APPLIED",&g_pre,&g_applied);
+        w3m_delta_text("APPLIED_TO_ARMED",&g_applied,&g_armed);
+        w3m_delta_text("ARMED_TO_END",&g_armed,&g_during_end);
+        w3m_delta_text("END_TO_RESTORED",&g_during_end,&g_restored);
+        w3m_delta_text("PRE_TO_RESTORED",&g_pre,&g_restored);
+        if (g_has_mid)
+            w3m_delta_text("ARMED_TO_MID",&g_armed,&g_mid);
+        snprintf(b,sizeof(b),"VIDEO filename=%s frames=%d apply=%d restore=%d cleanup=%d stop=%d drain=%d writer_io=%d writer_post=%d\n",
+            g_video_name,g_stop_frame_count,g_apply_rc,g_restore_rc,g_stop_clean,
+            g_stop_transfer_rc,g_stop_drain_rc,g_writer_io,g_writer_post);
+        w3m_text(b);
+        uint32_t fc=g_frames;
+        if (fc>W3M_MAX_FRAMES)fc=W3M_MAX_FRAMES;
+        for (uint32_t k=0;k<fc;++k)
+        {
+            snprintf(b,sizeof(b),"FRAME index=%d owner_seq=%d complete_seq=%d slot=%d time_us=%d\n",
+                (int)g_meta[k].frame,(int)g_meta[k].owner,
+                (int)g_meta[k].complete,g_meta[k].slot,(int)g_meta[k].us);
+            w3m_text(b);
+        }
+        /* Source-buffer canaries from the oversized guarded b0=1 path.
+         * A nominal-tail change is expected to be informative, not an
+         * automatic failure. Writes past 16-bit capacity force failure. */
+        struct rp_w3_guard_status guard;
+        memset(&guard,0,sizeof(guard));
+        raw_vid_rp_guard_get_status(&guard);
+        if (guard.enabled)
+        {
+            snprintf(b,sizeof(b),
+                "W3GUARD enabled=%d nominal=%d full16=%d alloc=%d checked=%d nominal_changed=%d full16_changed=%d after16_changed=%d first_nominal_slot=%d first_after16_slot=%d\n",
+                (int)guard.enabled,(int)guard.nominal,(int)guard.nominal16,
+                (int)guard.allocated_per_slot,(int)guard.checked,
+                (int)guard.nominal_changed,(int)guard.full16_changed,
+                (int)guard.after16_changed,(int)guard.first_nominal_slot,
+                (int)guard.first_after16_slot);
+            w3m_text(b);
+            W3M_LOG("GUARD case=%s nominal_changed=%d full16_changed=%d after16_changed=%d frames=%d",
+                c->id,(int)guard.nominal_changed,(int)guard.full16_changed,
+                (int)guard.after16_changed,(int)guard.checked);
+            if (!guard.checked || guard.after16_changed)
+                failed=-142;
+        }
+        if (g_log_error || !w3m_case_ok()) failed=-140;
+        W3M_LOG("RUN_END id=%s result=%s file=%s frames=%d apply=%d restore=%d",
+                c->id,failed?"FAIL":"PASS",g_video_name,g_stop_frame_count,
+                g_apply_rc,g_restore_rc);
+        w3m_text(failed?"RUN_END FAIL (automatic interlock)\n":"RUN_END PASS\n");
+        if (g_log_error && !failed) failed=-141;
+        if (failed)break;
+        if (g_single_case < 0 && i+1 < run_limit)
+        {
+            int settle_rc=w3m_wait_inter_session_ready();
+            if (settle_rc)
+            {
+                failed=-160;
+                W3M_LOG("SETTLE FAIL after %s rc=%d; no next test",c->id,settle_rc);
+                w3m_text("ABORT INTER_SESSION_STABILIZATION_FAILED; cold boot needed\n");
+                break;
+            }
+        }
+        /* Flush per-case result before the state advances. The file is
+         * deliberately reopened per write to survive power interruption. */
+        uint32_t next=(uint32_t)i+1u;
+        int boundary=(next < (uint32_t)run_limit && w3m_group_boundary(i) &&
+                     !g_no_restart);
+        uint32_t status_next = next==(uint32_t)run_limit ? W3M_COMPLETE :
+                                boundary ? W3M_NEEDS_REBOOT : W3M_READY;
+        if (g_single_case < 0 && w3m_state_store(next,status_next))
+        { failed=-150; W3M_LOG("ABORT checkpoint commit failed id=%s",c->id);break; }
+        g_index=-1;
+        if (boundary)
+        {
+            checkpoint=1;
+            g_interlock=1;
+            W3M_LOG("CHECKPOINT after=%s next=%s POWER OFF camera; cold boot; select same menu entry",
+                    c->id,w3m_cases[next].id);
+            snprintf(b,sizeof(b),"CHECKPOINT after=%s next=%s; POWER OFF; cold boot; reselect W3 PU Auto Matrix\n",
+                     c->id,w3m_cases[next].id);
+            w3m_text(b);
+            break;
+        }
+        /* v4: inter-case passive gap; no 10-Hz probes or extra preflights. */
+    }
+    w3m_stage_drain();
+    if ((failed || g_abort) && g_single_case < 0)
+        (void)w3m_state_store(g_index>=0?(uint32_t)g_index:first,W3M_FAILED);
+    snprintf(b,sizeof(b),"\nMATRIX_END status=%s rc=%d abort=%d checkpoint=%d last_index=%d\n",
+             failed||g_abort?"ABORT":checkpoint?"CHECKPOINT":"PASS",
+             failed,(int)g_abort,checkpoint,(int)g_index);
+    w3m_text(b);
+    W3M_LOG("MATRIX_END rc=%d abort=%d checkpoint=%d last=%d",failed,
+            (int)g_abort,checkpoint,(int)g_index);
+    FIO_CloseFile(g_log);
+    g_log=NULL;
+    if (failed || g_abort || checkpoint || g_log_error) g_interlock=1;
+    g_index=-1;
+    g_running=0;
+}
+
+/* DryOS task_create() returns a uint32_t encoded token, NOT a signed errno.
+ * The low 16 bits of (token >> 1) contain the task ID; high bits are opaque.
+ * An observed working task returned 0x806C015E (task_id=0x00AF), which
+ * compares negative if incorrectly stored in int. Keep this interpretation
+ * centralized for ALL / SINGLE / PAIR W3MAT launchers. */
+static int w3m_create_runner_task(const char *task_name)
+{
+    uint32_t token = task_create(task_name, 0x13, 0x3000, w3m_runner, NULL);
+    uint32_t id = (token >> 1) & 0xffffu;
+    W3M_LOG("TASK_CREATE name=%s token=%x id=%d", task_name,
+            (unsigned int)token, (int)id);
+    /* Zero token / no task ID cannot identify a created task. Do not mistake
+     * the token sign bit for an error. All other failures remain fail-closed
+     * via the ordinary START timeout / next-session interlock. */
+    return (token == 0u || token == 0xffffffffu || id == 0u) ? -1 : 0;
+}
+
+void rp_w3_matrix_launch_mode(int no_restart)
+{
+    if (g_running) { rp_w3_matrix_abort_user(); return; }
+    if (g_interlock || !is_camera("RP","1.6.0") || !lv ||
+        get_recording_state()!=INACTIVE)
+    { W3M_LOG("REFUSE require RP 1.6.0, LV and idle recorder");return; }
+    g_single_case = -1;
+    g_pair_only = 0;
+    g_no_restart = no_restart ? 1 : 0; /* freeze BEFORE task creation */
+    W3M_LOG("MENU_START mode=%s state=%s cases=%d",
+            g_no_restart ? "ALL_NO_REBOOT" : "CHECKPOINTED",
+            w3m_state_filename(), W3M_CASES);
+    g_running=1;g_abort=0;g_index=-1;
+    int rc=w3m_create_runner_task(g_no_restart?"w3all":"w3matrix");
+    if (rc) {g_running=0;W3M_LOG("ABORT task create rc=%d",rc);}
+}
+void rp_w3_matrix_launch(void) { rp_w3_matrix_launch_mode(0); }
+void rp_w3_matrix_launch_single(int case_index)
+{
+    if (case_index < 0 || case_index >= W3M_CASES) return;
+    if (g_running) { rp_w3_matrix_abort_user(); return; }
+    if (g_interlock || !is_camera("RP","1.6.0") || !lv ||
+        get_recording_state()!=INACTIVE) return;
+    /* Does NOT load, create or modify W3ALL.STA/W3MAT.STA. */
+    g_single_case=case_index;
+    g_pair_only=0;
+    g_no_restart=1;
+    g_running=1;g_abort=0;g_index=-1;
+    W3M_LOG("SINGLE_START case=%s index=%d",w3m_cases[case_index].id,case_index);
+    int rc=w3m_create_runner_task("w3single");
+    if (rc) {g_running=0;W3M_LOG("SINGLE task create rc=%d",rc);}
+}
+
+/* A00/A01 automated pair reproducer, independent of W3ALL.STA.
+ * Will refuse to replay an interrupted W3PAIR.STA without explicit
+ * removal after inspection, avoiding an automatic retry of a crash. */
+void rp_w3_matrix_launch_pair(void)
+{
+    if (g_running) { rp_w3_matrix_abort_user(); return; }
+    if (g_interlock || !is_camera("RP","1.6.0") || !lv ||
+        get_recording_state()!=INACTIVE)
+    { W3M_LOG("PAIR REFUSE: require RP, LV and idle recorder"); return; }
+    g_single_case=-1;
+    g_pair_only=1;
+    g_no_restart=1;
+    g_running=1;g_abort=0;g_index=-1;
+    W3M_LOG("PAIR_START A00->A01 checkpoint=W3PAIR.STA");
+    int rc=w3m_create_runner_task("w3pair");
+    if (rc) {g_running=0;W3M_LOG("PAIR task create rc=%d",rc);}
+}
