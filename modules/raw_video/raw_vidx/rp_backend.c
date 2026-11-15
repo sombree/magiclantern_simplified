@@ -2959,3 +2959,491 @@ void raw_vid_rp_write_report(int stop_rc)
 
     FIO_CloseFile(f);
 }
+
+int raw_vid_rp_cleanup_after_raw_off(void)
+{
+    if (!is_camera("RP", "1.6.0")) return 0;
+
+    int rc = 0;
+    if (rp_m2m_session_active || rp_m2m_session_lock)
+        if (raw_vid_rp_m2m_session_stop()) rc |= 1;
+
+    rp_steer_active = 0;
+    rp_capture_active = 0;
+    rp_complete_frame_size = 0u;
+    rp_dmb();
+
+    if (rp_mnav_valid)
+    {
+        rp_mnav_restore_original();
+        if (rp_rd32(rp_mnav.desc + 0x00u) != rp_mnav_desc_original[0] ||
+            rp_rd32(rp_mnav.desc + 0x04u) != rp_mnav_desc_original[1] ||
+            rp_rd32(rp_mnav.desc + 0x08u) != rp_mnav_desc_original[2] ||
+            rp_rd32(rp_mnav.desc + 0x0Cu) != rp_mnav_desc_original[3])
+            rc |= 2;
+    }
+
+    if (rp_tap_installed)
+        if (rp_restore_complete_tap()) rc |= 4;
+
+    rp_free_capture_buffers();
+    rp_mnav_valid = 0u;
+    memset(&rp_mnav, 0, sizeof(rp_mnav));
+    rp_reset_runtime_state();
+    rp_dmb();
+
+    if (rp_bit_depth_active) rc |= 16;
+    if (rp_linear_packing_active) rc |= 32;
+    if (rp_complete_slot_read() != RP_CANON_COMPLETE_NOP_THUMB ||
+        rp_complete_arg_read() != 0u) rc |= 128;
+
+    RP_BACKEND_TRACE("CLEANUP RAM-MNAV rc=%x bppact=%d linear=%d tap=%d",
+                     rc,(int)rp_bit_depth_active,
+                     (int)rp_linear_packing_active,(int)rp_tap_installed);
+
+    rp_m2m_session_frames = 0;
+    rp_m2m_session_errors = 0;
+    rp_m2m_session_sum_us = 0;
+    rp_m2m_session_min_us = 0;
+    rp_m2m_session_max_us = 0;
+    rp_report_fake_width = 0u;
+    rp_report_getsize = 0u;
+    rp_report_hw_geom = 0u;
+    rp_report_pu2_mode = 0u;
+    return rc;
+}
+
+static void raw_vid_rp_steer_task(void)
+{
+    TASK_LOOP
+    {
+        if (!rp_steer_active)
+        {
+            msleep(20);
+            continue;
+        }
+
+        uint32_t expected_dma = rp_steer_expected_dma;
+        int expected_slot = rp_steer_expected_slot;
+
+        if (expected_dma != 0u)
+        {
+            if (rp_chain_is(expected_dma))
+            {
+                rp_steer_latch_count++;
+                rp_steer_last_latch_us = get_us_clock();
+                rp_owner_seq = rp_steer_latch_count;
+
+                if (expected_slot >= 0)
+                {
+                    /* Publish -> latch -> in-flight.  This ordering prevents a
+                     * stale W3+EC value from completing a recycled address before
+                     * the newly scheduled transfer has actually reached W3. */
+                    if (rp_bufs[expected_slot].state != RPBUF_ARMED)
+                    {
+                        rp_bad_complete++;
+                        rp_fatal = 1;
+                        rp_ownership_uncertain = 1;
+                        rp_stop_requested = 1;
+                    }
+                    else
+                    {
+                        rp_bufs[expected_slot].state = RPBUF_IN_FLIGHT;
+                        rp_current_slot = expected_slot;
+                        rp_bufs[expected_slot].owner_seq = rp_owner_seq;
+                    }
+                }
+                else
+                {
+                    rp_current_slot = -1;
+                    rp_steer_canon_frames++;
+                }
+
+                rp_steer_expected_dma = 0u;
+                rp_steer_expected_slot = -2;
+                rp_dmb();
+
+                /* v183.4 timing: NEXT destination is written immediately after
+                 * the current provider->Evf->Mem1->W3 latch, never from Complete. */
+                if (rp_stop_requested)
+                {
+                    uint32_t canon = rp_mnav.pool_base + rp_mnav_desc_original[1];
+                    if (expected_slot < 0)
+                    {
+                        rp_handback_done = 1;
+                        rp_dmb();
+                    }
+                    else
+                    {
+                        rp_mnav_write_offset(canon);
+                        rp_steer_expected_slot = -1;
+                        rp_steer_expected_dma = canon;
+                        rp_steer_last_latch_us = get_us_clock();
+                        rp_dmb();
+                    }
+                }
+                else
+                {
+                    int next = rp_find_free_capture_buffer();
+                    if (next >= 0)
+                    {
+                        rp_bufs[next].state = RPBUF_ARMED;
+                        rp_bufs[next].owner_seq = 0u;
+                        rp_bufs[next].complete_seq = 0u;
+                        rp_mnav_write_offset(rp_bufs[next].dma);
+                        rp_steer_expected_slot = next;
+                        rp_steer_expected_dma = rp_bufs[next].dma;
+                        rp_steer_last_latch_us = get_us_clock();
+                        rp_dmb();
+                    }
+                    else
+                    {
+                        /* Backpressure: do not overwrite READY/QUEUED slots.
+                         * Hand the next frame to Canon and resume ML when a slot
+                         * becomes FREE. */
+                        uint32_t canon = rp_mnav.pool_base + rp_mnav_desc_original[1];
+                        rp_steer_no_free++;
+                        rp_drop_no_free++;
+                        rp_mnav_write_offset(canon);
+                        rp_steer_expected_slot = -1;
+                        rp_steer_expected_dma = canon;
+                        rp_steer_last_latch_us = get_us_clock();
+                        rp_dmb();
+                    }
+                }
+            }
+            else if (rp_steer_last_latch_us != 0u &&
+                     (uint32_t)(get_us_clock() - rp_steer_last_latch_us) >
+                         RP_STEER_LATCH_TIMEOUT_US)
+            {
+                rp_fatal = 1;
+                rp_ownership_uncertain = 1;
+                rp_stop_requested = 1;
+                if (!rp_stop_task_scheduled)
+                {
+                    rp_stop_task_scheduled = 1;
+                    raw_vid_request_stop_async();
+                }
+            }
+        }
+        else
+        {
+            /* We are sitting on Canon because the source ring was full.  As
+             * soon as worker releases any slot, steer a future frame back to ML. */
+            if (rp_stop_requested)
+            {
+                if (rp_current_slot < 0)
+                {
+                    rp_handback_done = 1;
+                    rp_dmb();
+                }
+                else
+                {
+                    uint32_t canon = rp_mnav.pool_base + rp_mnav_desc_original[1];
+                    rp_mnav_write_offset(canon);
+                    rp_steer_expected_slot = -1;
+                    rp_steer_expected_dma = canon;
+                    rp_steer_last_latch_us = get_us_clock();
+                    rp_dmb();
+                }
+            }
+            else if (rp_current_slot < 0)
+            {
+                int next = rp_find_free_capture_buffer();
+                if (next >= 0)
+                {
+                    rp_bufs[next].state = RPBUF_ARMED;
+                    rp_mnav_write_offset(rp_bufs[next].dma);
+                    rp_steer_expected_slot = next;
+                    rp_steer_expected_dma = rp_bufs[next].dma;
+                    rp_steer_last_latch_us = get_us_clock();
+                    rp_dmb();
+                }
+            }
+        }
+
+        if (rp_handback_done)
+        {
+            int any_in_flight = 0;
+            for (int i = 0; i < rp_buf_count; i++)
+                if (rp_bufs[i].state == RPBUF_ARMED ||
+                    rp_bufs[i].state == RPBUF_IN_FLIGHT)
+                    any_in_flight = 1;
+            if (!any_in_flight)
+                rp_final_complete_seen = 1;
+        }
+
+        msleep(RP_STEER_POLL_MS);
+    }
+}
+
+static void raw_vid_rp_ready_task(void)
+{
+    TASK_LOOP
+    {
+        /* No IRQ->semaphore handoff: poll the tiny shared state from task
+         * context.  On RP msleep(1) is coarse but still comfortably below the
+         * validated 4K frame period used for the first recorder bring-up. */
+        if (!rp_capture_active && !rp_fatal)
+        {
+            msleep(20);
+            continue;
+        }
+
+        if (rp_fatal && !rp_stop_task_scheduled)
+        {
+            rp_stop_task_scheduled = 1;
+            raw_vid_request_stop_async();
+        }
+
+        while (1)
+        {
+            rp_dmb();
+            int i = rp_find_oldest_ready_buffer();
+            if (i < 0)
+                break;
+
+            if (rp_stop_requested)
+            {
+                rp_bufs[i].state = RPBUF_FREE;
+                continue;
+            }
+
+            /* Complete already happened. Sample tiny guard windows in this
+             * TASK before handing the slot to worker/MLV. Never in IRQ. */
+            int guard_rc = rp_guard_probe_slot(i);
+            if (guard_rc)
+            {
+                rp_fatal = 1;
+                rp_dmb();
+                RP_BACKEND_TRACE("W3GUARD span FAIL slot=%d rc=%d; abort",
+                                 i, guard_rc); /* telemetry before STOP */
+                RP_BACKEND_TRACE("W3GUARD POST16 CORRUPT slot=%d; abort",
+                                 i);
+                rp_bufs[i].state = RPBUF_FREE;
+                if (!rp_stop_task_scheduled)
+                {
+                    rp_stop_task_scheduled=1;
+                    raw_vid_request_stop_async();
+                }
+                continue;
+            }
+
+            struct raw_vid_event *event = get_empty_event();
+            if (!event)
+            {
+                rp_bufs[i].state = RPBUF_FREE;
+                rp_fatal = 1;
+                if (!rp_stop_task_scheduled)
+                {
+                    rp_stop_task_scheduled = 1;
+                    raw_vid_request_stop_async();
+                }
+                continue;
+            }
+
+            if (take_semaphore(rp_post_sem, 1000))
+            {
+                release_event(event);
+                rp_bufs[i].state = RPBUF_FREE;
+                rp_post_fail++;
+                rp_fatal = 1;
+                continue;
+            }
+
+            if (rp_stop_requested || rp_bufs[i].state != RPBUF_READY)
+            {
+                give_semaphore(rp_post_sem);
+                release_event(event);
+                if (rp_bufs[i].state == RPBUF_READY)
+                    rp_bufs[i].state = RPBUF_FREE;
+                continue;
+            }
+
+            event->creation_time = get_ms_clock();
+            event->type = IMAGE_DATA;
+            event->src = (char *)rp_bufs[i].dma;
+            event->orig_frame_width = raw_info.pitch;
+            event->x = rp_crop_x;
+            event->y = rp_crop_y;
+            event->w = rp_crop_w;
+            event->h = rp_crop_h;
+            /* A full-frame physical W3 capture uses the actual descriptor
+             * payload. Crops remain sized according to packed sensor BPP. */
+            event->size = (rp_w3_matrix_case_active() &&
+                rp_crop_x == 0u && rp_crop_y == 0u &&
+                rp_crop_w == (uint32_t)raw_info.width &&
+                rp_crop_h == (uint32_t)raw_info.height &&
+                rp_capture_wire_payload_bytes != 0u)
+                ? (int32_t)rp_capture_wire_payload_bytes
+                : (int32_t)(rp_crop_w * rp_crop_h * BPP / 8u);
+            event->capture_slot = i;
+
+            rp_bufs[i].state = RPBUF_QUEUED;
+            rp_dmb();
+
+            int err = msg_queue_post(rp_event_q, (uint32_t)event);
+            give_semaphore(rp_post_sem);
+
+            if (err)
+            {
+                rp_bufs[i].state = RPBUF_FREE;
+                release_event(event);
+                rp_post_fail++;
+                rp_fatal = 1;
+            }
+            else
+            {
+                rp_queued_count++;
+            }
+        }
+
+        msleep(1);
+    }
+}
+
+
+
+/* ---------------- W3 PU single-field experiment (TASK ONLY) ----------------
+ * Only the Canon-owned Mem1 config low byte is changed; no unproven MMIO
+ * register is ever directly written.  Canon's routine E057D290 subsequently
+ * applies the RMW mask to PU2+0x24.  No write in IRQ / owner / Complete path. */
+static volatile uint32_t *rp_matrix_field = NULL;
+static uint32_t rp_matrix_original = 0;
+static uint32_t rp_matrix_original_pu = 0;
+static uint32_t rp_matrix_mask = 0;
+/* Declared with the persistent Mem1/PU state, before preflight. */
+
+void raw_vid_rp_matrix_snapshot(struct rp_w3_hw_snapshot *s)
+{
+    if (!s) return;
+    memset(s, 0, sizeof(*s));
+    uint32_t state = *(volatile uint32_t *)(uintptr_t)RP_MEM1_STATE_PTR_LITERAL;
+    if (!(state & 3u) && state >= 0x1000u && state < 0x40000000u)
+    {
+        s->mem1_state = state;
+        for (int i = 0; i < 5; ++i)
+            s->cfg[i] = *(volatile uint32_t *)(uintptr_t)
+                (state + RP_MEM1_PACK_CFG_OFF + 4u * (uint32_t)i);
+    }
+    s->pu24 = *(volatile uint32_t *)(uintptr_t)(RP_PU2_PBLOCK + 0x24u);
+    s->pu28 = *(volatile uint32_t *)(uintptr_t)(RP_PU2_PBLOCK + 0x28u);
+    s->pu20 = *(volatile uint32_t *)(uintptr_t)(RP_PU2_PBLOCK + 0x20u);
+    s->w350 = *(volatile uint32_t *)(uintptr_t)(RP_RAW_PBLOCK + 0x50u);
+    s->w3a0 = *(volatile uint32_t *)(uintptr_t)(RP_RAW_PBLOCK + 0xA0u);
+    s->w3d0 = *(volatile uint32_t *)(uintptr_t)(RP_RAW_PBLOCK + 0xD0u);
+    s->cb = rp_complete_slot_read();
+    s->cb_arg = rp_complete_arg_read();
+    s->owner = rp_owner_seq;
+    s->complete = rp_complete_seq;
+    s->drops = rp_drop_no_free;
+    s->overlap = rp_overlap_count;
+    s->bad_complete = rp_bad_complete;
+    s->post_fail = rp_post_fail;
+    s->fatal = rp_fatal;
+}
+
+int raw_vid_rp_matrix_apply(int index, int value)
+{
+    if (!is_camera("RP", "1.6.0") || rp_matrix_applied || rp_capture_active)
+        return -300;
+    if (index < 0) return 0; /* explicit N / no change */
+    if ((index != 0 && index != 1 && index != 4) ||
+        value < 0 || value > (index == 4 ? 3 : 1)) return -301;
+    volatile uint32_t *f = rp_get_pack_cfg_field(4u * (uint32_t)index);
+    if (!f) return -302;
+    uint32_t orig = *f;
+    if ((orig & 0xffu) > (uint32_t)(index == 4 ? 3 : 1)) return -303;
+    /* b0 and b4 unknown: baseline must be exactly zero before testing. */
+    if ((index == 0 || index == 4) && (orig & 0xffu) != 0u)
+        return -304;
+    uint32_t mask = index == 0 ? 0x00000100u :
+                    index == 1 ? 0x00100000u : 0x00030000u;
+    uint32_t oldpu = *(volatile uint32_t *)(uintptr_t)(RP_PU2_PBLOCK + 0x24u);
+    uint32_t expect = (oldpu & ~mask) |
+        (index == 0 ? ((uint32_t)value << 8) :
+         index == 1 ? ((uint32_t)value << 20) :
+                      ((uint32_t)value << 16));
+    rp_matrix_field = f;
+    rp_matrix_original = orig;
+    rp_matrix_original_pu = oldpu;
+    rp_matrix_mask = mask;
+    /* Arm the restore BEFORE the write so an apply timeout is reversible. */
+    rp_matrix_applied = 1;
+    RP_BACKEND_TRACE("W3MAT ABOUT_TO_WRITE field=%d old=%x new=%x before_pu=%x",
+                     index,orig,(orig & ~0xffu)|(uint32_t)value,oldpu);
+    *f = (orig & ~0xffu) | (uint32_t)value;
+    rp_dmb();
+    uint32_t seen = 0u, t0 = get_us_clock();
+    do {
+        seen = *(volatile uint32_t *)(uintptr_t)(RP_PU2_PBLOCK + 0x24u);
+        if ((seen & mask) == (expect & mask) && (*f & 0xffu) == (uint32_t)value)
+        {
+            RP_BACKEND_TRACE("W3MAT APPLY index=%d old=%x new=%x pu=%x expect=%x",
+                             index, orig, *f, seen, expect);
+            return 0;
+        }
+        msleep(5);
+    } while ((uint32_t)(get_us_clock() - t0) < 250000u);
+    RP_BACKEND_TRACE("W3MAT APPLY TIMEOUT index=%d value=%d oldpu=%x seen=%x",
+                     index, value, oldpu, seen);
+    return -305; /* worker cleanup invokes restore */
+}
+
+int raw_vid_rp_matrix_restore(void)
+{
+    if (!rp_matrix_applied) return 0;
+    if (!rp_matrix_field) return -310;
+    *rp_matrix_field = rp_matrix_original;
+    rp_dmb();
+    uint32_t t0 = get_us_clock(), pu = 0u;
+    int rc = -311;
+    do {
+        pu = *(volatile uint32_t *)(uintptr_t)(RP_PU2_PBLOCK + 0x24u);
+        if ((pu & rp_matrix_mask) == (rp_matrix_original_pu & rp_matrix_mask) &&
+            *rp_matrix_field == rp_matrix_original)
+        { rc = 0; break; }
+        msleep(5);
+    } while ((uint32_t)(get_us_clock() - t0) < 250000u);
+    RP_BACKEND_TRACE("W3MAT RESTORE rc=%d old=%x field=%x pu=%x baseline=%x",
+                     rc, rp_matrix_original, (uint32_t)*rp_matrix_field,
+                     pu, rp_matrix_original_pu);
+    /* Fail-closed after mismatch; never assume hardware restored. */
+    if (rc == 0)
+    {
+        rp_matrix_applied = 0;
+        rp_matrix_field = NULL;
+        rp_matrix_mask = 0u;
+    }
+    return rc;
+}
+
+/* Defensive W3/PU sanity before any capture slot becomes hardware-owned. */
+int raw_vid_rp_matrix_validate_pre_arm(void)
+{
+    if (rp_capture_active) return -321;
+    uint32_t geom = *(volatile uint32_t *)(uintptr_t)(RP_RAW_PBLOCK + 0x50u);
+    uint32_t pitch = geom & 0xffffu;
+    uint32_t height = (geom >> 16) + 1u;
+    if (pitch != (uint32_t)raw_info.pitch ||
+        height != (uint32_t)raw_info.height ||
+        pitch * height != (uint32_t)raw_info.frame_size ||
+        raw_info.width <= 0 || raw_info.bits_per_pixel <= 0 ||
+        (uint32_t)raw_info.width * (uint32_t)raw_info.bits_per_pixel / 8u != pitch)
+    {
+        RP_BACKEND_TRACE("W3MAT GEOMETRY FAIL geom=%x pitch=%d height=%d info=%d,%d,%d",
+          geom, (int)pitch,(int)height,raw_info.pitch,raw_info.height,raw_info.frame_size);
+        return -322;
+    }
+    if (*(volatile uint32_t *)(uintptr_t)(RP_RAW_PBLOCK + 0xD0u) != 3u)
+        return -323;
+    if (rp_complete_slot_read() != RP_CANON_COMPLETE_NOP_THUMB ||
+        rp_complete_arg_read() != 0u) return -324;
+    return 0;
+}
+
+void raw_vid_rp_matrix_counts(uint32_t *owner, uint32_t *complete)
+{
+    if (owner) *owner = rp_owner_seq;
+    if (complete) *complete = rp_complete_seq;
+}
