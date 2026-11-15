@@ -4168,7 +4168,385 @@ static void worker(void)
                     RP_START_TRACE("S5 PASS MLV closed + RAW released");
                     break;
                 }
-                FIO_WriteFile(raw_vid_fp, header_buf, header_size);
+
+                if (is_camera("RP", "1.6.0") &&
+                    ((RP_START_PROBE_STAGE >= 6 && RP_START_PROBE_STAGE <= 8) ||
+                     RP_START_PROBE_STAGE == 10))
+                {
+                    RP_START_TRACE("S%d backend sub-probe begin", RP_START_PROBE_STAGE);
+                    err = raw_vid_rp_probe_start(event->w, event->h,
+                                                 RP_START_PROBE_STAGE);
+                    RP_START_TRACE("S%d backend sub-probe returned rc=%d",
+                                   RP_START_PROBE_STAGE, err);
+
+                    /* Stages 6..8 and 10 are non-recording.  The backend
+                     * restores allocated buffers or the RAM Complete tap;
+                     * unwind the ordinary worker-side start state as in S5. */
+                    stop_mlv_session();
+                    if (raw_vid_fp != NULL)
+                    {
+                        FIO_CloseFile(raw_vid_fp);
+                        raw_vid_fp = NULL;
+                    }
+                    raw_lv_release();
+                    free_crop_bufs(crop_bufs);
+                    crop_buf = NULL;
+                    break;
+                }
+
+                if (is_camera("RP", "1.6.0"))
+                {
+                    /* Freeze W3 transport only after RAW-LV, capture geometry,
+                     * metadata and early file operations have succeeded.
+                     * Every subsequent start-failure path performs RAW cleanup. */
+                    RP_START_TRACE("RAM-MNAV REC sample=%d output=%d,%d",
+                        session.bits_per_pixel,event->w,event->h);
+                    /* RAM-only Mem1/MNAV capture never installs a ROM hook.
+                     * Keep regular buffer/callback ownership checks below. */
+                    RP_START_TRACE("RAM-MNAV prepare before BPP");
+                    rp_w3_matrix_stage(50,0);
+                    err = raw_vid_rp_prepare_capture_backend();
+                    rp_w3_matrix_stage(51,err);
+                    RP_START_TRACE("RAM-MNAV prepare rc=%d", err);
+                    if (err)
+                    {
+                        SEND_LOG_DATA_STR("ERROR: RP RAM-only capture preflight failed\n");
+                        raw_vid_set_active_bpp(14);
+                        stop_mlv_session();
+                        if (raw_vid_fp != NULL)
+                        {
+                            FIO_CloseFile(raw_vid_fp);
+                            raw_vid_fp = NULL;
+                        }
+                        raw_lv_release();
+                        raw_vid_rp_cleanup_after_raw_off();
+                        free_crop_bufs(crop_bufs);
+                        crop_buf = NULL;
+                        break;
+                    }
+
+                    /* Freeze requested depth for the whole recording.  v23 uses
+                     * only writable Mem1 RAM: cfg.b2 plus the active source
+                     * width.  E0379A16 produces the raw pitch and Canon SetSize
+                     * applies its native 0x7ffffffe xb mask; no E057 hook. */
+                    int requested_bpp = session.bits_per_pixel;
+                    RP_START_TRACE("BPP apply begin req=%d raw=%d pitch=%d size=%d",
+                                   requested_bpp, raw_info.bits_per_pixel,
+                                   raw_info.pitch, raw_info.frame_size);
+                    rp_w3_matrix_stage(60,requested_bpp);
+                    err = raw_vid_rp_set_bit_depth(requested_bpp);
+                    rp_w3_matrix_stage(61,err);
+                    if (err)
+                    {
+                        RP_START_TRACE("BPP apply FAIL req=%d rc=%d", requested_bpp, err);
+                        SEND_LOG_DATA_STR("ERROR: RP native RAW bit-depth switch failed\n");
+                        raw_vid_set_active_bpp(14);
+                        stop_mlv_session();
+                        if (raw_vid_fp != NULL)
+                        {
+                            FIO_CloseFile(raw_vid_fp);
+                            raw_vid_fp = NULL;
+                        }
+                        raw_lv_release();
+                        raw_vid_rp_cleanup_after_raw_off();
+                        free_crop_bufs(crop_bufs);
+                        crop_buf = NULL;
+                        break;
+                    }
+                    raw_vid_set_active_bpp(requested_bpp);
+                    RP_START_TRACE("BPP apply PASS bpp=%d pitch=%d size=%d",
+                                   raw_info.bits_per_pixel, raw_info.pitch,
+                                   raw_info.frame_size);
+
+                    if (raw_vid_codec_is_crx(rp_record_codec))
+                    {
+                        /*
+                         * v148/v149 causal proof on the same Mem1/W3/PU2 path:
+                         * cfg b3 low byte / PU2 bit0 selects contiguous LE
+                         * serialization at 14, 12 and 10 bit.
+                         *
+                         * set_bit_depth() has already established cfg[2],
+                         * pBlock pitch and raw_info for requested_bpp.
+                         * Now change b3 only and require the exact PU2 mode
+                         * delta before any CRX capture ownership is installed.
+                         */
+                        err = raw_vid_rp_set_linear_packing();
+                        RP_START_TRACE("LINEAR apply bpp=%d rc=%d PU2-ready",
+                                       requested_bpp, err);
+                        if (err)
+                        {
+                            SEND_LOG_DATA_STR("ERROR: RP CRX linear PackUnpack switch failed\n");
+                            raw_vid_rp_restore_bit_depth();
+                            raw_vid_set_active_bpp(14);
+                            stop_mlv_session();
+                            if (raw_vid_fp != NULL)
+                            {
+                                FIO_CloseFile(raw_vid_fp);
+                                raw_vid_fp = NULL;
+                            }
+                            raw_lv_release();
+                            raw_vid_rp_cleanup_after_raw_off();
+                            free_crop_bufs(crop_bufs);
+                            crop_buf = NULL;
+                            break;
+                        }
+                    }
+
+                    if (rp_w3_matrix_case_active())
+                    {
+                        /* The recorder already owns RAW-LV and Canon has established
+                         * BPP/pitch. Set experimental fields BEFORE W3 ownership. */
+                        if (rp_w3_matrix_requires_linear())
+                        {
+                            rp_w3_matrix_stage(70,requested_bpp);
+                            err = raw_vid_rp_set_linear_packing();
+                            rp_w3_matrix_stage(71,err);
+                        }
+                        else
+                            err = 0;
+                        if (!err) rp_w3_matrix_capture_pre();
+                        if (!err)
+                        {
+                            rp_w3_matrix_stage(72,rp_w3_matrix_field_index());
+                            err = raw_vid_rp_matrix_apply(
+                                rp_w3_matrix_field_index(), rp_w3_matrix_field_value());
+                        }
+                        if (!err) err = raw_vid_rp_matrix_validate_pre_arm();
+                        rp_w3_matrix_apply_result(err);
+                        rp_w3_matrix_stage(73,err);
+                        if (err)
+                        {
+                            RP_START_TRACE("W3MAT APPLY FAIL rc=%d", err);
+                            raw_vid_rp_matrix_restore();
+                            raw_vid_rp_restore_bit_depth();
+                            stop_mlv_session();
+                            if (raw_vid_fp) { FIO_CloseFile(raw_vid_fp); raw_vid_fp = NULL; }
+                            raw_lv_release();
+                            raw_vid_rp_cleanup_after_raw_off();
+                            free_crop_bufs(crop_bufs); crop_buf = NULL;
+                            break;
+                        }
+                    }
+                    if (RP_START_PROBE_STAGE == 36)
+                    {
+                        /* v3D ordering is deliberate:
+                         *   1. reserve the proven 3-slot RP source ring;
+                         *   2. only then ask Canon for ALL remaining shoot RAM.
+                         * capture_active remains zero throughout both steps. */
+                        RP_START_TRACE("S36 PREPARE source ring begin");
+                        rp_w3_matrix_stage(90,0);
+                        err = raw_vid_rp_prepare(event->x, event->y,
+                                                 event->w, event->h);
+                        rp_w3_matrix_stage(91,err);
+                        RP_START_TRACE("S36 PREPARE source ring rc=%d bytes=%dKB",
+                                       err,
+                                       (int)(raw_vid_rp_capture_buffer_bytes() / 1024u));
+                        if (err)
+                        {
+                            SEND_LOG_DATA_STR("ERROR: RP capture source-ring prepare failed\n");
+                            if (rp_w3_matrix_case_active())
+                                raw_vid_rp_matrix_restore();
+                            raw_vid_rp_restore_bit_depth();
+                            raw_vid_set_active_bpp(14);
+                            stop_mlv_session();
+                            if (raw_vid_fp != NULL)
+                            {
+                                FIO_CloseFile(raw_vid_fp);
+                                raw_vid_fp = NULL;
+                            }
+                            raw_lv_release();
+                            raw_vid_rp_cleanup_after_raw_off();
+                            free_crop_bufs(crop_bufs);
+                            crop_buf = NULL;
+                            break;
+                        }
+
+                        /* The matrix captures entire physical W3. The output
+                         * slot capacity follows the DMA descriptor's CURRENT
+                         * payload length, not the sensor sample precision.
+                         * In v6 the descriptor is still packed 10/12/14. */
+                        uint32_t output_payload =
+                            (rp_w3_matrix_case_active() &&
+                             event->resolution_mode == RAW_VID_RES_W3_TRANSPORT)
+                            ? (raw_vid_rp_wire_payload_bytes()
+                               ? raw_vid_rp_wire_payload_bytes()
+                               : (uint32_t)raw_info.frame_size)
+                            : event->w * event->h * (uint32_t)requested_bpp / 8u;
+                        uint32_t slot_work_bytes = output_payload;
+                        uint32_t crx_reserve = 0;
+                        if (raw_vid_codec_is_crx(rp_record_codec))
+                        {
+                            /* Runtime Canon logs show four CRX result segments
+                             * whose aggregate capacity is ~5/4 of packed input.
+                             * Add the same 25% reserve plus bounded revision-2 header/staging headroom
+                             * instead of a fixed +512 KiB, which is insufficient
+                             * for the observed 12-bit expansion case. */
+                            uint32_t expansion =
+                                (output_payload + (RP_CRX_SLOT_EXPANSION_DIV - 1u)) /
+                                RP_CRX_SLOT_EXPANSION_DIV;
+                            crx_reserve = expansion + RP_CRX_SLOT_META_HEADROOM;
+                            if (crx_reserve < expansion ||
+                                output_payload > 0xFFFFFFFFu - crx_reserve)
+                            {
+                                err = -1;
+                            }
+                            else
+                            {
+                                slot_work_bytes = output_payload + crx_reserve;
+                                err = rp_alloc_frame_slots(slot_work_bytes);
+                            }
+                        }
+                        else
+                        {
+                            err = rp_alloc_frame_slots(slot_work_bytes);
+                        }
+                        RP_START_TRACE("S36 SLOT work codec=%d raw=%d reserve=%d work=%d rc=%d",
+                                       rp_record_codec, (int)output_payload,
+                                       (int)crx_reserve, (int)slot_work_bytes, err);
+                        if (err)
+                        {
+                            SEND_LOG_DATA_STR("ERROR: RP shoot-suite frame-slot pool allocation failed\n");
+                            if (rp_w3_matrix_case_active())
+                                raw_vid_rp_matrix_restore();
+                            raw_vid_rp_restore_bit_depth();
+                            raw_vid_set_active_bpp(14);
+                            stop_mlv_session();
+                            if (raw_vid_fp != NULL)
+                            {
+                                FIO_CloseFile(raw_vid_fp);
+                                raw_vid_fp = NULL;
+                            }
+                            raw_lv_release();
+                            rp_free_frame_slots();
+                            raw_vid_rp_cleanup_after_raw_off();
+                            free_crop_bufs(crop_bufs);
+                            crop_buf = NULL;
+                            break;
+                        }
+                    }
+                }
+
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 33)
+                {
+                    RP_START_TRACE("S33 mem2mem session start begin");
+                    err = raw_vid_rp_m2m_session_start();
+                    RP_START_TRACE("S33 mem2mem session start rc=%d", err);
+                    if (err)
+                    {
+                        SEND_LOG_DATA_STR("ERROR: RP mem2mem session failed to start\n");
+                        stop_mlv_session();
+
+                        if (raw_vid_fp != NULL)
+                        {
+                            FIO_CloseFile(raw_vid_fp);
+                            raw_vid_fp = NULL;
+                        }
+
+                        if (rp_w3_matrix_case_active())
+                            raw_vid_rp_matrix_restore();
+                        raw_vid_rp_restore_bit_depth();
+                        raw_lv_release();
+                        /* Reverse v3D allocation order: return the shoot suite
+                         * before releasing the separately-reserved source ring. */
+                        rp_free_frame_slots();
+                        raw_vid_rp_cleanup_after_raw_off();
+                        free_crop_bufs(crop_bufs);
+                        crop_buf = NULL;
+                        break;
+                    }
+                }
+
+                if (is_camera("RP", "1.6.0"))
+                {
+                    /*
+                     * Stages 14..18 all start the real RP owner/Complete
+                     * backend.  IMAGE_DATA handling above decides whether the
+                     * worker only consumes, performs one probe crop, or runs
+                     * the complete MLV accumulation pipeline.
+                     */
+                    if (RP_START_PROBE_STAGE == 36)
+                    {
+                        /* Three ML source slots + the class-2 MNAV singleton are
+                         * already prepared.  Arm the Complete observer and publish
+                         * the first desc.offset; latch steering runs in task context. */
+                        RP_START_TRACE("S14 before prepared capture ARM");
+                        rp_w3_matrix_stage(100,0);
+                        err = raw_vid_rp_arm();
+                        rp_w3_matrix_stage(101,err);
+                    }
+                    else
+                    {
+                        RP_START_TRACE("S14 before full capture backend start");
+                        err = raw_vid_rp_start(event->x, event->y,
+                                               event->w, event->h);
+                    }
+                    RP_START_TRACE("S14 capture backend returned rc=%d", err);
+                    if (err)
+                    {
+                        SEND_LOG_DATA_STR("ERROR: RP capture backend failed to start\n");
+                        if (RP_START_PROBE_STAGE == 33)
+                            raw_vid_rp_m2m_session_stop();
+                        stop_mlv_session();
+
+                        if (raw_vid_fp != NULL)
+                        {
+                            FIO_CloseFile(raw_vid_fp);
+                            raw_vid_fp = NULL;
+                        }
+
+                        if (rp_w3_matrix_case_active())
+                            raw_vid_rp_matrix_restore();
+                        raw_vid_rp_restore_bit_depth();
+                        raw_lv_release();
+                        /* Reverse v3D allocation order: return the shoot suite
+                         * before releasing the separately-reserved source ring. */
+                        rp_free_frame_slots();
+                        raw_vid_rp_cleanup_after_raw_off();
+                        free_crop_bufs(crop_bufs);
+                        crop_buf = NULL;
+                        break;
+                    }
+                }
+
+                /* All start-time allocations/hooks are now established.
+                 * Install the v22 AlgsMgr post-event tracker only at this final
+                 * point, immediately before exposing ACTIVE; no StartEncode can
+                 * occur before this point.  This avoids leaving the manager RAM
+                 * callback wrapped if an earlier source-ring/backend setup fails. */
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 36 &&
+                    raw_vid_codec_is_crx(rp_record_codec))
+                {
+                    err = raw_vid_rp_crx_begin_session_mode(
+                        raw_vid_codec_is_lossy_crx(rp_record_codec));
+                    RP_START_TRACE("CRX session arm rc=%d owner=%x",
+                                   err, *(volatile uint32_t *)0x00005A30u);
+                    if (err)
+                    {
+                        SEND_LOG_DATA_STR("ERROR: RP CRX session/reclaim tracker failed to arm\n");
+                        raw_vid_rp_stop_before_raw_off();
+                        raw_vid_rp_restore_bit_depth();
+                        raw_vid_set_active_bpp(14);
+                        stop_mlv_session();
+                        if (raw_vid_fp != NULL)
+                        {
+                            FIO_CloseFile(raw_vid_fp);
+                            raw_vid_fp = NULL;
+                        }
+                        raw_lv_release();
+#if RP_V110_SSRAM_OUTPUT
+                        /* Failed CRX arm may leave a native callback pending.
+                         * Keep all destination arenas until reboot. */
+                        rp_v110_owner_quarantine=1;
+                        rp_writer_storage_lockout=1;
+#else
+                        rp_free_frame_slots();
+#endif
+                        raw_vid_rp_cleanup_after_raw_off();
+                        free_crop_bufs(crop_bufs);
+                        crop_buf = NULL;
+                        break;
+                    }
+                }
 
                 #ifdef RAW_VID_LOG
                 send_log_data_str("Recording is active\n");
