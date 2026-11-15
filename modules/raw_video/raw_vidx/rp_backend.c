@@ -2633,3 +2633,329 @@ int raw_vid_rp_probe_start(uint32_t crop_w, uint32_t crop_h, int stage)
                      (int)completes, restore_rc);
     return restore_rc;
 }
+
+int raw_vid_rp_prepare_capture_backend(void)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return -100;
+
+    /* Ordering barrier preserved for worker.c.  Normal capture is steered
+     * exclusively by writable Mem1/MNAV state and the RAM Complete slot. */
+    rp_capture_active = 0;
+    rp_dmb();
+
+    RP_BACKEND_TRACE("CAPTURE prepare RAM-only PASS");
+    return 0;
+}
+
+int raw_vid_rp_session_preflight(void)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return 0;
+    if (!rp_backend_initialized)
+        return -120;
+    if (rp_capture_active || rp_tap_installed || rp_steer_active)
+        return -122;
+    if (rp_bit_depth_active || rp_linear_packing_active ||
+        rp_pack_bpp_saved_valid || rp_mem1_saved_geom_valid)
+        return -123;
+    if (rp_m2m_session_active || rp_m2m_session_lock)
+        return -124;
+    if (rp_matrix_applied)
+        return -127;
+    if (rp_complete_slot_read() != RP_CANON_COMPLETE_NOP_THUMB ||
+        rp_complete_arg_read() != 0u)
+        return -125;
+
+    RP_BACKEND_TRACE("PREFLIGHT RAM-only PASS slot=%x arg=%x",
+                     rp_complete_slot_read(), rp_complete_arg_read());
+    return 0;
+}
+
+uint32_t raw_vid_rp_capture_buffer_bytes(void)
+{
+    return rp_capture_alloc_bytes;
+}
+
+int raw_vid_rp_prepare(uint32_t crop_x, uint32_t crop_y,
+                       uint32_t crop_w, uint32_t crop_h)
+{
+    if (!is_camera("RP", "1.6.0")) return -100;
+    if (rp_capture_active || rp_steer_active) return -1;
+    if (!rp_backend_initialized || !rp_event_q || !rp_post_sem) return -2;
+    if (!rp_geometry_supported() ||
+        !rp_crop_supported_at(crop_x, crop_y, crop_w, crop_h)) return -3;
+
+    /* Never carry a descriptor snapshot across a failed/aborted prepare. */
+    rp_mnav_valid = 0u;
+    memset(&rp_mnav, 0, sizeof(rp_mnav));
+    memset(rp_mnav_desc_original, 0, sizeof(rp_mnav_desc_original));
+    rp_mnav_read_original = 0;
+    rp_mnav_write_original = 0;
+
+    rp_reset_runtime_state();
+    rp_crop_x = crop_x; rp_crop_y = crop_y;
+    rp_crop_w = crop_w; rp_crop_h = crop_h;
+    rp_report_bpp = raw_info.bits_per_pixel;
+    rp_report_pitch = raw_info.pitch;
+    rp_report_frame_size = raw_info.frame_size;
+    rp_capture_wire_payload_bytes = (uint32_t)raw_info.frame_size;
+    rp_capture_wire_pitch = (uint32_t)raw_info.pitch;
+
+    if (rp_alloc_capture_buffers())
+        return -4;
+
+    /* Snapshot the same class-2 singleton descriptor proven by v167/v183.4.
+     * We never change pool/count/stride/read_idx/write_idx during recording. */
+    if (!rp_read_mnav(&rp_mnav))
+    {
+        rp_free_capture_buffers();
+        return -5;
+    }
+
+    uint32_t canon = rp_raw_get_buffer();
+    if (!canon || rp_mnav.count != 1u || rp_mnav.read_idx != 0 ||
+        rp_mnav.write_idx != 0 || rp_mnav.predicted_write != canon ||
+        !rp_chain_is(canon))
+    {
+        RP_BACKEND_TRACE("PREPARE MNAV REFUSE desc=%x off=%x stride=%d count=%d r=%d w=%d pred=%x canon=%x",
+                         rp_mnav.desc,rp_mnav.offset,(int)rp_mnav.stride,
+                         (int)rp_mnav.count,(int)rp_mnav.read_idx,
+                         (int)rp_mnav.write_idx,rp_mnav.predicted_write,canon);
+        rp_free_capture_buffers();
+        return -6;
+    }
+
+    rp_mnav_desc_original[0] = rp_rd32(rp_mnav.desc + 0x00u);
+    rp_mnav_desc_original[1] = rp_rd32(rp_mnav.desc + 0x04u);
+    rp_mnav_desc_original[2] = rp_rd32(rp_mnav.desc + 0x08u);
+    rp_mnav_desc_original[3] = rp_rd32(rp_mnav.desc + 0x0Cu);
+    rp_mnav_read_original = rp_mnav.read_idx;
+    rp_mnav_write_original = rp_mnav.write_idx;
+    rp_mnav_valid = 1u;
+
+    rp_dmb();
+    RP_BACKEND_TRACE("PREPARE RAM-MNAV PASS buffers=%d bytes=%dKB frame=%d bpp=%d pitch=%d desc=%x canon=%x",
+                     (int)rp_buf_count,(int)(rp_capture_alloc_bytes/1024u),
+                     raw_info.frame_size,raw_info.bits_per_pixel,raw_info.pitch,
+                     rp_mnav.desc,canon);
+    return 0;
+}
+
+int raw_vid_rp_arm(void)
+{
+    if (!is_camera("RP", "1.6.0")) return -100;
+    if (rp_capture_active || rp_steer_active) return -1;
+    if (!rp_backend_initialized || !rp_event_q || !rp_post_sem) return -2;
+    if (rp_buf_count != RP_CAPTURE_BUFS || !rp_mnav_valid) return -4;
+
+    uint32_t canon = rp_raw_get_buffer();
+    if (!canon || !rp_chain_is(canon) ||
+        rp_rd32(rp_mnav.desc + 0x00u) != rp_mnav_desc_original[0] ||
+        rp_rd32(rp_mnav.desc + 0x04u) != rp_mnav_desc_original[1] ||
+        rp_rd32(rp_mnav.desc + 0x08u) != rp_mnav_desc_original[2] ||
+        rp_rd32(rp_mnav.desc + 0x0Cu) != rp_mnav_desc_original[3])
+        return -5;
+
+    if (rp_install_complete_tap())
+        return -6;
+
+    rp_complete_frame_size = (uint32_t)raw_info.frame_size;
+    rp_complete_last_cur = 0u;
+    rp_complete_matched = 0u;
+    rp_complete_unmatched = 0u;
+
+    int first = rp_find_free_capture_buffer();
+    if (first < 0)
+    {
+        rp_restore_complete_tap();
+        return -7;
+    }
+
+    rp_bufs[first].state = RPBUF_ARMED;
+    rp_bufs[first].owner_seq = 0u;
+    rp_bufs[first].complete_seq = 0u;
+    rp_current_slot = -1;
+    rp_steer_expected_slot = first;
+    rp_steer_expected_dma = rp_bufs[first].dma;
+    rp_steer_last_latch_us = get_us_clock();
+    rp_mnav_write_offset(rp_bufs[first].dma);
+
+    if (rp_rd32(rp_mnav.desc + 0x04u) !=
+        rp_bufs[first].dma - rp_mnav.pool_base)
+    {
+        rp_bufs[first].state = RPBUF_FREE;
+        rp_mnav_restore_original();
+        rp_restore_complete_tap();
+        return -8;
+    }
+
+    rp_dmb();
+    rp_capture_active = 1;
+    rp_steer_active = 1;
+    rp_dmb();
+
+    RP_BACKEND_TRACE("ARM RAM-MNAV PASS first=%d dma=%x frame=%d geom=%x PU2=%x",
+                     first,rp_bufs[first].dma,(int)rp_complete_frame_size,
+                     rp_rd32(RP_RAW_PBLOCK + 0x50u),
+                     rp_rd32(RP_PU2_PBLOCK + RP_PU_MODE_OFF));
+    return 0;
+}
+
+int raw_vid_rp_start(uint32_t crop_x, uint32_t crop_y,
+                     uint32_t crop_w, uint32_t crop_h)
+{
+    /* Compatibility wrapper for the earlier probe/stage paths.  Stage36 v3D
+     * calls prepare() before shoot_malloc_suite(0), then arm() afterwards. */
+    int rc = raw_vid_rp_prepare(crop_x, crop_y, crop_w, crop_h);
+    if (rc)
+        return rc;
+
+    rc = raw_vid_rp_arm();
+    if (rc)
+        rp_free_capture_buffers();
+    return rc;
+}
+
+void raw_vid_rp_request_stop(void)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return;
+
+    rp_stop_requested = 1;
+    rp_dmb();
+
+    /* Serialize with READY->IMAGE_DATA posting.  When this returns, any image
+     * event already being posted is ahead of the later COMMAND_STOP event. */
+    if (rp_post_sem)
+    {
+        if (take_semaphore(rp_post_sem, 1000) == 0)
+            give_semaphore(rp_post_sem);
+    }
+
+}
+
+int raw_vid_rp_stop_before_raw_off(void)
+{
+    if (!is_camera("RP", "1.6.0")) return 0;
+    if (!rp_capture_active && !rp_tap_installed && !rp_steer_active) return 0;
+
+    raw_vid_rp_request_stop();
+
+    uint64_t start = rp_wall_us();
+    while ((!rp_handback_done || !rp_final_complete_seen) &&
+           (rp_wall_us() - start) < RP_STOP_TIMEOUT_US)
+        msleep(2);
+
+    int rc = 0;
+    if (!rp_handback_done) rc |= 1;
+    if (!rp_final_complete_seen) rc |= 2;
+    if (rp_ownership_uncertain) rc |= 16;
+    if (rp_fatal) rc |= 64;
+
+    rp_steer_active = 0;
+    rp_dmb();
+
+    /* desc.offset is the only MNAV field changed by v23, nevertheless restore
+     * the complete singleton snapshot and indices defensively before RAW off. */
+    if (rp_mnav_valid)
+    {
+        rp_mnav_restore_original();
+        uint32_t canon = rp_mnav.pool_base + rp_mnav_desc_original[1];
+        uint64_t hb0 = rp_wall_us();
+        while (!rp_chain_is(canon) && (rp_wall_us() - hb0) < 200000u)
+            msleep(1);
+        if (!rp_chain_is(canon)) rc |= 32;
+    }
+
+    if (rp_restore_complete_tap()) rc |= 4;
+    rp_complete_frame_size = 0u;
+    rp_capture_active = 0;
+    rp_dmb();
+
+    RP_BACKEND_TRACE("STOP RAM-MNAV rc=%x latch=%d canon_gap=%d matched=%d unmatched=%d handback=%d final=%d",
+                     rc,(int)rp_steer_latch_count,(int)rp_steer_canon_frames,
+                     (int)rp_complete_matched,(int)rp_complete_unmatched,
+                     (int)rp_handback_done,(int)rp_final_complete_seen);
+    return rc;
+}
+
+void raw_vid_rp_release_buffer(int slot)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return;
+    if (slot < 0 || slot >= rp_buf_count)
+        return;
+
+    if (rp_bufs[slot].state != RPBUF_QUEUED)
+    {
+        rp_bad_complete++;
+        rp_fatal = 1;
+        rp_dmb();
+        return;
+    }
+
+    rp_bufs[slot].state = RPBUF_FREE;
+    rp_released_count++;
+    rp_dmb();
+}
+
+void raw_vid_rp_write_report(int stop_rc)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return;
+
+    FIO_RemoveFile(RP_REPORT_PATH);
+    FILE *f = FIO_CreateFile(RP_REPORT_PATH);
+    if (!f)
+        return;
+
+    char b[1280];
+    int n = snprintf(b, sizeof(b),
+        "EOS RP 1.6.0 raw_vidx backend " RP_BACKEND_VERSION "\n"
+        "geometry=%dx%d bpp=%d pitch=%d frame_size=%d crop=%dx%d@%d,%d buffers=%d\n"
+        "ram_bpp={fakeW=%d getsize=%d hw_geom=%08x pu2=%08x} "
+        "mnav={valid=%d state=%08x desc=%08x pool=%d base=%08x orig_off=%08x stride=%d count=%d r=%d w=%d}\n"
+        "steer={latch=%d canon=%d no_free=%d desc_writes=%d current=%d expected_slot=%d expected_dma=%08x}\n"
+        "complete={seq=%d matched=%d unmatched=%d last_cur=%08x ready=%d queued=%d released=%d}\n"
+        "errors={drop_no_free=%d bad_complete=%d post_fail=%d overlap=%d fatal=%d ownership_uncertain=%d}\n"
+        "stop={handback=%d final_complete=%d rc=0x%x tap=%d slot_now=%08x arg_now=%08x}\n"
+        "m2m={frames=%d errors=%d min_us=%d max_us=%d avg_us=%d active=%d}\n",
+        raw_info.width, raw_info.height, rp_report_bpp, rp_report_pitch,
+        rp_report_frame_size, (int)rp_crop_w, (int)rp_crop_h,
+        (int)rp_crop_x, (int)rp_crop_y, (int)rp_buf_count,
+        (int)rp_report_fake_width, (int)rp_report_getsize,
+        rp_report_hw_geom, rp_report_pu2_mode,
+        (int)rp_mnav_valid, rp_mnav.state, rp_mnav.desc, (int)rp_mnav.pool,
+        rp_mnav.pool_base, rp_mnav_desc_original[1],
+        (int)rp_mnav_desc_original[2], (int)rp_mnav_desc_original[3],
+        (int)rp_mnav_read_original, (int)rp_mnav_write_original,
+        (int)rp_steer_latch_count, (int)rp_steer_canon_frames,
+        (int)rp_steer_no_free, (int)rp_steer_desc_writes,
+        rp_current_slot, rp_steer_expected_slot, (uint32_t)rp_steer_expected_dma,
+        (int)rp_complete_seq, (int)rp_complete_matched,
+        (int)rp_complete_unmatched, (uint32_t)rp_complete_last_cur,
+        (int)rp_ready_count, (int)rp_queued_count, (int)rp_released_count,
+        (int)rp_drop_no_free, (int)rp_bad_complete, (int)rp_post_fail,
+        (int)rp_overlap_count, (int)rp_fatal, (int)rp_ownership_uncertain,
+        (int)rp_handback_done, (int)rp_final_complete_seen, stop_rc,
+        (int)rp_tap_installed, rp_complete_slot_read(), rp_complete_arg_read(),
+        (int)rp_m2m_session_frames, (int)rp_m2m_session_errors,
+        (int)rp_m2m_session_min_us, (int)rp_m2m_session_max_us,
+        rp_m2m_session_frames
+            ? (int)(rp_m2m_session_sum_us / rp_m2m_session_frames) : 0,
+        (int)rp_m2m_session_active);
+
+    if (n > 0)
+        FIO_WriteFile(f, b, (uint32_t)n);
+
+    n = snprintf(b, sizeof(b),
+        "capture_backend=RAM-only complete_slot=%x "
+        "wire={pitch=%d payload=%d}\n",
+        RP_COMPLETE_SLOT,
+        (int)rp_capture_wire_pitch, (int)rp_capture_wire_payload_bytes);
+    if (n > 0)
+        FIO_WriteFile(f, b, (uint32_t)n);
+
+    FIO_CloseFile(f);
+}
