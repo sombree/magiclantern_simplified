@@ -975,3 +975,324 @@ int raw_vid_rp_set_linear_packing(void)
                      (uint32_t)(uintptr_t)field, pu_before, seen);
     return 0;
 }
+
+int raw_vid_rp_restore_linear_packing(void)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return -90;
+    if (!rp_linear_packing_active)
+        return 0;
+    if (!rp_pack_b3_field)
+        return -91;
+
+    *rp_pack_b3_field = rp_pack_b3_saved;
+    rp_dmb();
+
+    uint32_t seen = 0;
+    uint32_t t0 = get_us_clock();
+
+    while ((uint32_t)(get_us_clock() - t0) < 250000u)
+    {
+        seen = *(volatile uint32_t *)(RP_PU2_PBLOCK + RP_PU_MODE_OFF);
+        if (seen == rp_linear_baseline_pu2 &&
+            *rp_pack_b3_field == rp_pack_b3_saved)
+            break;
+        msleep(5);
+    }
+
+    int rc = 0;
+    if (seen != rp_linear_baseline_pu2 ||
+        *rp_pack_b3_field != rp_pack_b3_saved)
+        rc = -92;
+
+    RP_BACKEND_TRACE("LINEAR restore rc=%d PU2=%x baseline=%x field=%x",
+                     rc, seen, rp_linear_baseline_pu2,
+                     (uint32_t)*rp_pack_b3_field);
+
+    rp_pack_b3_field = NULL;
+    rp_pack_b3_saved = 0;
+    rp_linear_baseline_pu2 = 0;
+    rp_linear_packing_active = 0;
+    return rc;
+}
+
+static volatile uint32_t *rp_get_pack_bpp_field(void)
+{
+    return rp_get_pack_cfg_field(RP_MEM1_PACK_BPP_OFF);
+}
+
+static int rp_make_lower_bpp_plan(int bpp, uint32_t *fake_width,
+                                  uint32_t *physical_pitch,
+                                  uint32_t *physical_size,
+                                  uint32_t *expected_getsize,
+                                  uint32_t *expected_geom,
+                                  uint32_t *expected_mode)
+{
+    if (bpp != 10 && bpp != 12) return -1;
+
+    uint32_t width = (uint32_t)raw_info.width;
+    uint32_t height = (uint32_t)raw_info.height;
+    uint32_t fake = 0u;
+
+    if (width == 2128u && height == 1208u)
+        fake = (bpp == 12) ? 1824u : 1520u;
+    else if (width == 3728u && height == 2052u)
+        fake = (bpp == 12) ? 3196u : 2663u;
+    else
+        return -2; /* lower-BPP RAM geometry not runtime-proven here */
+
+    uint32_t raw_pitch = (uint32_t)(((uint64_t)fake * 7u) >> 2);
+    uint32_t pitch = (uint32_t)(((uint64_t)width * (uint32_t)bpp) >> 3);
+    uint32_t size = pitch * height;
+    uint32_t getter = (uint32_t)(((uint64_t)fake * height * 7u) >> 2);
+    uint32_t geom = rp_rd32(RP_RAW_PBLOCK + 0x50u);
+    uint32_t pu = rp_rd32(RP_PU2_PBLOCK + RP_PU_MODE_OFF);
+
+    if ((raw_pitch & RP_SETSIZE_XB_MASK) != pitch)
+        return -3;
+
+    *fake_width = fake;
+    *physical_pitch = pitch;
+    *physical_size = size;
+    *expected_getsize = getter;
+    *expected_geom = (geom & 0xffff0000u) | pitch;
+    *expected_mode = (pu & ~0x30u) | ((bpp == 12) ? 0x10u : 0u);
+    return 0;
+}
+
+int raw_vid_rp_set_bit_depth(int bpp)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return -50;
+    if (bpp != 10 && bpp != 12 && bpp != 14)
+        return -51;
+    if (rp_bit_depth_active)
+        return (raw_info.bits_per_pixel == bpp) ? 0 : -52;
+
+    rp_saved_raw_bpp = raw_info.bits_per_pixel;
+    rp_saved_raw_pitch = raw_info.pitch;
+    rp_saved_raw_frame_size = raw_info.frame_size;
+    rp_saved_pu2_mode = rp_rd32(RP_PU2_PBLOCK + RP_PU_MODE_OFF);
+
+    if (bpp == 14)
+    {
+        rp_fake_width = (uint32_t)raw_info.width;
+        rp_expected_getsize = (uint32_t)raw_info.frame_size;
+        rp_expected_hw_geom = rp_rd32(RP_RAW_PBLOCK + 0x50u);
+        rp_expected_pu2_mode = rp_saved_pu2_mode;
+        rp_report_fake_width = rp_fake_width;
+        rp_report_getsize = rp_expected_getsize;
+        rp_report_hw_geom = rp_expected_hw_geom;
+        rp_report_pu2_mode = rp_expected_pu2_mode;
+        rp_mem1_saved_geom_valid = 0u;
+        rp_bit_depth_active = 1;
+        RP_BACKEND_TRACE("BPP RAM set 14 native pitch=%d", raw_info.pitch);
+        return 0;
+    }
+
+    volatile uint32_t *field = rp_get_pack_bpp_field();
+    if (!field)
+        return -54;
+
+    uint32_t old = *field;
+    uint32_t old_mode = old & 0xffu;
+    if (old_mode != 2u && old_mode != 3u)
+        return -55;
+
+    struct rp_mem1_geometry g;
+    if (!rp_read_mem1_geometry(&g) ||
+        g.active_w != (uint32_t)raw_info.width ||
+        g.active_h != (uint32_t)raw_info.height ||
+        g.selected_w != (uint32_t)raw_info.width ||
+        g.selected_h != (uint32_t)raw_info.height)
+        return -57;
+
+    uint32_t fake=0, pitch=0, frame=0, getter=0, exp_geom=0, exp_mode=0;
+    int plan_rc = rp_make_lower_bpp_plan(bpp, &fake, &pitch, &frame,
+                                         &getter, &exp_geom, &exp_mode);
+    if (plan_rc)
+        return -58;
+
+    rp_pack_bpp_field = field;
+    rp_pack_bpp_saved = old;
+    rp_pack_bpp_saved_valid = 1;
+    rp_mem1_saved_geom = g;
+    rp_mem1_saved_geom_valid = 1u;
+
+    const uint32_t mode = (bpp == 12) ? 1u : 0u;
+
+    /* Fail-safe ordering: first reduce PackUnpack precision while Canon still
+     * uses the larger native14 row pitch, then shrink the writable Mem1 source
+     * width.  Any inter-frame race can create padding, never a 14-bit row in a
+     * lower-BPP-sized destination. */
+    *field = (old & ~0xffu) | mode;
+    rp_dmb();
+
+    uint32_t t0 = get_us_clock();
+    while ((uint32_t)(get_us_clock() - t0) < 250000u)
+    {
+        uint32_t pu = rp_rd32(RP_PU2_PBLOCK + RP_PU_MODE_OFF);
+        if ((pu & ~RP_PU_BIT0) == (exp_mode & ~RP_PU_BIT0))
+            break;
+        msleep(1);
+    }
+
+    rp_wr32(g.state + g.active_w_off, fake);
+    rp_dmb();
+
+    uint32_t seen_geom=0, seen_getter=0, seen_pu=0;
+    t0 = get_us_clock();
+    while ((uint32_t)(get_us_clock() - t0) < 350000u)
+    {
+        struct rp_mem1_geometry now;
+        if (rp_read_mem1_geometry(&now))
+        {
+            seen_geom = rp_rd32(RP_RAW_PBLOCK + 0x50u);
+            seen_getter = rp_raw_get_size();
+            seen_pu = rp_rd32(RP_PU2_PBLOCK + RP_PU_MODE_OFF);
+            if (now.active_pair == g.active_pair &&
+                now.active_w == fake && now.active_h == g.active_h &&
+                now.selected_w == fake && now.selected_h == g.active_h &&
+                seen_geom == exp_geom && seen_getter == getter &&
+                (seen_pu & ~RP_PU_BIT0) == (exp_mode & ~RP_PU_BIT0))
+                break;
+        }
+        msleep(1);
+    }
+
+    if (seen_geom != exp_geom || seen_getter != getter ||
+        (seen_pu & ~RP_PU_BIT0) != (exp_mode & ~RP_PU_BIT0))
+    {
+        /* Safe rollback: restore native width before restoring 14-bit mode. */
+        rp_wr32(g.state + g.active_w_off, g.active_w);
+        rp_dmb();
+        *field = old;
+        rp_dmb();
+        rp_pack_bpp_saved_valid = 0;
+        rp_pack_bpp_field = NULL;
+        rp_mem1_saved_geom_valid = 0u;
+        RP_BACKEND_TRACE("BPP RAM apply FAIL req=%d fake=%d geom=%x/%x get=%d/%d pu=%x/%x",
+                         bpp,(int)fake,seen_geom,exp_geom,(int)seen_getter,
+                         (int)getter,seen_pu,exp_mode);
+        return -56;
+    }
+
+    rp_fake_width = fake;
+    rp_expected_getsize = getter;
+    rp_expected_hw_geom = exp_geom;
+    rp_expected_pu2_mode = exp_mode;
+    rp_report_fake_width = fake;
+    rp_report_getsize = getter;
+    rp_report_hw_geom = exp_geom;
+    rp_report_pu2_mode = exp_mode;
+    raw_info.bits_per_pixel = bpp;
+    raw_info.pitch = (int)pitch;
+    raw_info.frame_size = (int)frame;
+    rp_bit_depth_active = 1;
+
+    RP_BACKEND_TRACE("BPP RAM set %d fakeW=%d pitch=%d frame=%d GetSize=%d geom=%x",
+                     bpp,(int)fake,(int)pitch,(int)frame,(int)getter,exp_geom);
+    return 0;
+}
+
+int raw_vid_rp_restore_bit_depth(void)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return -60;
+
+    int linear_rc = raw_vid_rp_restore_linear_packing();
+
+    if (!rp_bit_depth_active)
+    {
+        raw_vid_set_active_bpp(14);
+        return linear_rc;
+    }
+
+    int old_bpp = raw_info.bits_per_pixel;
+    int rc = 0;
+
+    if (old_bpp != 14 && rp_pack_bpp_saved_valid && rp_pack_bpp_field &&
+        rp_mem1_saved_geom_valid)
+    {
+        /* Reverse of entry ordering: enlarge physical row first while samples
+         * are still 10/12-bit, then restore Canon's native14 PackUnpack. */
+        rp_wr32(rp_mem1_saved_geom.state + rp_mem1_saved_geom.active_w_off,
+                rp_mem1_saved_geom.active_w);
+        rp_dmb();
+
+        uint32_t native_geom =
+            ((rp_mem1_saved_geom.active_h - 1u) << 16) |
+            ((uint32_t)rp_saved_raw_pitch & 0xffffu);
+        uint32_t t0 = get_us_clock();
+        while ((uint32_t)(get_us_clock() - t0) < 250000u)
+        {
+            struct rp_mem1_geometry now;
+            if (rp_read_mem1_geometry(&now) &&
+                now.active_w == rp_mem1_saved_geom.active_w &&
+                rp_rd32(RP_RAW_PBLOCK + 0x50u) == native_geom)
+                break;
+            msleep(1);
+        }
+
+        *rp_pack_bpp_field = rp_pack_bpp_saved;
+        rp_dmb();
+
+        t0 = get_us_clock();
+        while ((uint32_t)(get_us_clock() - t0) < 250000u)
+        {
+            uint32_t pu = rp_rd32(RP_PU2_PBLOCK + RP_PU_MODE_OFF);
+            if (rp_rd32(RP_RAW_PBLOCK + 0x50u) == native_geom &&
+                *rp_pack_bpp_field == rp_pack_bpp_saved &&
+                (pu & ~RP_PU_BIT0) == (rp_saved_pu2_mode & ~RP_PU_BIT0))
+                break;
+            msleep(1);
+        }
+
+        if (rp_rd32(RP_RAW_PBLOCK + 0x50u) != native_geom ||
+            *rp_pack_bpp_field != rp_pack_bpp_saved)
+            rc = -61;
+    }
+
+    raw_info.bits_per_pixel = rp_saved_raw_bpp;
+    raw_info.pitch = rp_saved_raw_pitch;
+    raw_info.frame_size = rp_saved_raw_frame_size;
+    rp_pack_bpp_saved_valid = 0;
+    rp_pack_bpp_field = NULL;
+    rp_mem1_saved_geom_valid = 0u;
+    rp_fake_width = 0u;
+    rp_expected_getsize = 0u;
+    rp_expected_hw_geom = 0u;
+    rp_expected_pu2_mode = 0u;
+    rp_bit_depth_active = 0;
+    raw_vid_set_active_bpp(14);
+
+    RP_BACKEND_TRACE("BPP RAM restore from=%d to=%d pitch=%d linear_rc=%d",
+                     old_bpp, raw_info.bits_per_pixel, raw_info.pitch, linear_rc);
+
+    if (rc == 0 && linear_rc != 0) rc = linear_rc;
+    return rc;
+}
+
+
+static int rp_geometry_supported(void)
+{
+    int bpp = raw_info.bits_per_pixel;
+    if (bpp != 10 && bpp != 12 && bpp != 14)
+        return 0;
+
+    uint64_t expected = (uint64_t)raw_info.width *
+                        (uint64_t)raw_info.height * (uint64_t)bpp / 8u;
+    if (expected != (uint32_t)raw_info.frame_size)
+        return 0;
+    if ((uint32_t)raw_info.pitch !=
+        (uint32_t)raw_info.width * (uint32_t)bpp / 8u)
+        return 0;
+
+    if (raw_info.width == 3728 && raw_info.height == 2052)
+        return 1;
+    if (raw_info.width == 2128 && raw_info.height == 1208)
+        return 1;
+    if (raw_info.width == 2128 && raw_info.height == 864)
+        return 1;
+    return 0;
+}
