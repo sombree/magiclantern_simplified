@@ -1802,3 +1802,269 @@ out:
     RP_BACKEND_TRACE("M2M S%d END rc=%d", stage, rc);
     return rc;
 }
+
+
+/* Persistent mem2mem resource/power session for stage 33.
+ *
+ * This mirrors M50's edmac_memcpy_res_lock()/unlock() split rather than
+ * keeping channel callbacks armed between frames.  The RP EFsVcopy wrappers
+ * recovered statically map to the same lifecycle: E0726704 creates/locks the
+ * engine resources, E07267AC wakes the subchips, E07267B2 suspends them and
+ * E072672E unlocks/destroys the resource entry. */
+int raw_vid_rp_m2m_session_start(void)
+{
+    typedef void *(*res_create_fn)(uint32_t *, uint32_t);
+    typedef void (*res_lock_fn)(void *);
+
+    static uint32_t resources[2] = { 0x000100ADu, 0x000100BBu };
+
+    if (!is_camera("RP", "1.6.0"))
+        return -220;
+    if (rp_m2m_session_active || rp_m2m_session_lock)
+        return -221;
+
+    res_create_fn res_create = RP_THUMB_FN(RP_FN_RES_CREATE, res_create_fn);
+    res_lock_fn res_lock = RP_THUMB_FN(RP_FN_RES_LOCK, res_lock_fn);
+
+    void *lock = res_create(resources, 2u);
+    if (!lock)
+        return -222;
+
+    res_lock(lock);
+    rp_dmb();
+
+    rp_m2m_session_lock = lock;
+    rp_m2m_session_frames = 0;
+    rp_m2m_session_errors = 0;
+    rp_m2m_session_sum_us = 0;
+    rp_m2m_session_min_us = 0;
+    rp_m2m_session_max_us = 0;
+    rp_m2m_session_active = 1;
+    rp_dmb();
+
+    RP_BACKEND_TRACE("M2M33 session START lock=%x", (uint32_t)lock);
+    return 0;
+}
+
+int raw_vid_rp_m2m_session_stop(void)
+{
+    typedef void (*res_unlock_fn)(void);
+    typedef void (*res_destroy_fn)(void *);
+
+    if (!is_camera("RP", "1.6.0"))
+        return 0;
+    if (!rp_m2m_session_active && !rp_m2m_session_lock)
+        return 0;
+
+    res_unlock_fn res_unlock = RP_THUMB_FN(RP_FN_RES_UNLOCK, res_unlock_fn);
+    res_destroy_fn res_destroy = RP_THUMB_FN(RP_FN_RES_DESTROY, res_destroy_fn);
+
+    rp_m2m_session_active = 0;
+    rp_dmb();
+
+    void *lock = rp_m2m_session_lock;
+    rp_m2m_session_lock = NULL;
+
+    if (lock)
+    {
+        res_unlock();
+        res_destroy(lock);
+    }
+
+    RP_BACKEND_TRACE("M2M33 session STOP frames=%d err=%d min=%d max=%d avg=%d",
+                     (int)rp_m2m_session_frames,
+                     (int)rp_m2m_session_errors,
+                     (int)rp_m2m_session_min_us,
+                     (int)rp_m2m_session_max_us,
+                     rp_m2m_session_frames
+                         ? (int)(rp_m2m_session_sum_us / rp_m2m_session_frames)
+                         : 0);
+    return 0;
+}
+
+/* Continuous real-frame crop for stage 33.  Resources/power are session-level,
+ * while the transaction itself deliberately stays M50-like and synchronous:
+ * reset channels -> Boomer -> CBRs -> pack reset -> addr/size/mode ->
+ * WR arm -> RD arm -> final RD kick -> wait both Complete -> CBR teardown. */
+int raw_vid_rp_m2m_crop_frame(const void *src_frame, uint32_t src_pitch,
+                              uint32_t crop_x, uint32_t crop_y,
+                              uint32_t crop_w, uint32_t crop_h,
+                              void *dst, uint32_t dst_size,
+                              uint32_t *elapsed_us)
+{
+    typedef void (*ch_fn)(uint32_t);
+    typedef void (*boomer_select_fn)(uint32_t, uint32_t);
+    typedef void (*register_cbr_fn)(int, void (*)(void *), void *);
+    struct rp_d8_edmac_info_frame
+    {
+        uint32_t off1s;
+        uint32_t off1a;
+        uint32_t off1b;
+        uint32_t off2s;
+        uint32_t off2a;
+        uint32_t off2b;
+        uint32_t off3;
+        uint32_t xs;
+        uint32_t xa;
+        uint32_t xb;
+        uint32_t ys;
+        uint32_t ya;
+        uint32_t yb;
+        uint32_t xn;
+        uint32_t yn;
+    };
+    typedef void (*set_addr_fn)(uint32_t, void *);
+    typedef void (*set_size_fn)(uint32_t, struct rp_d8_edmac_info_frame *);
+    typedef void (*set_mode_fn)(uint32_t, uint32_t);
+
+    if (!is_camera("RP", "1.6.0") || !rp_m2m_session_active ||
+        !rp_m2m_session_lock || !src_frame || !dst)
+        return -230;
+    if (!crop_w || !crop_h || !src_pitch)
+        return -231;
+
+    const uint32_t row_bytes = crop_w * BPP / 8u;
+    const uint32_t src_x_bytes = ((crop_x + 7u) / 8u) * BPP;
+    const uint32_t src_y = (crop_y / 2u) * 2u;
+    const uint32_t payload = row_bytes * crop_h;
+
+    if (!row_bytes || src_x_bytes + row_bytes > src_pitch)
+        return -232;
+    if (payload > dst_size)
+        return -233;
+    if (src_y + crop_h > (uint32_t)raw_info.height)
+        return -234;
+
+    uint8_t *src = (uint8_t *)UNCACHEABLE(src_frame)
+                 + src_y * src_pitch + src_x_bytes;
+    uint8_t *out = (uint8_t *)UNCACHEABLE(dst);
+    if ((((uintptr_t)src | (uintptr_t)out) & 3u) != 0)
+        return -235;
+
+    ch_fn edmac_reset = RP_THUMB_FN(RP_FN_EDMAC_RESET, ch_fn);
+    ch_fn edmac_final_start_rd = RP_THUMB_FN(RP_FN_EDMAC_FINAL_START_RD, ch_fn);
+    register_cbr_fn register_complete =
+        RP_THUMB_FN(RP_FN_EDMAC_REGISTER_COMPLETE, register_cbr_fn);
+    ch_fn unregister_complete =
+        RP_THUMB_FN(RP_FN_EDMAC_UNREGISTER_COMPLETE, ch_fn);
+    ch_fn boomer_reset = RP_THUMB_FN(RP_FN_BOOMER_RESET, ch_fn);
+    boomer_select_fn boomer_select =
+        RP_THUMB_FN(RP_FN_BOOMER_SELECT, boomer_select_fn);
+    ch_fn stop_boomer = RP_THUMB_FN(RP_FN_EDMAC_STOP_BOOMER, ch_fn);
+    ch_fn reset_pack = RP_THUMB_FN(RP_FN_EDMAC_RESET_PACK, ch_fn);
+    ch_fn edmac_arm = RP_THUMB_FN(RP_FN_EDMAC_ARM, ch_fn);
+    set_addr_fn set_address = RP_THUMB_FN(RP_FN_EDMAC_SET_ADDRESS, set_addr_fn);
+    set_size_fn set_size = RP_THUMB_FN(RP_FN_EDMAC_SET_SIZE, set_size_fn);
+    set_mode_fn set_mode = RP_THUMB_FN(RP_FN_EDMAC_SET_MODE, set_mode_fn);
+
+    struct rp_d8_edmac_info_frame src_info = {0};
+    struct rp_d8_edmac_info_frame dst_info = {0};
+    src_info.off1b = src_pitch - row_bytes;
+    src_info.xb = row_bytes;
+    src_info.yb = crop_h - 1u;
+    dst_info.xb = row_bytes;
+    dst_info.yb = crop_h - 1u;
+
+    int cbrs_registered = 0;
+    int boomer_configured = 0;
+    int transfer_started = 0;
+    int rc = -236;
+
+    edmac_reset(RP_M2M_WR_CH);
+    edmac_reset(RP_M2M_RD_CH);
+    boomer_reset(RP_M2M_WR_CH);
+    boomer_select(RP_M2M_WR_CH, RP_M2M_BOOMER_SELECTOR);
+    boomer_configured = 1;
+
+    rp_m2m_rd_done = 0;
+    rp_m2m_wr_done = 0;
+    rp_dmb();
+
+    register_complete((int)RP_M2M_WR_CH, rp_m2m_complete_cbr, (void *)2u);
+    register_complete((int)RP_M2M_RD_CH, rp_m2m_complete_cbr, (void *)1u);
+    cbrs_registered = 1;
+
+    reset_pack(RP_M2M_WR_CH);
+    reset_pack(RP_M2M_RD_CH);
+    set_address(RP_M2M_WR_CH, out);
+    set_address(RP_M2M_RD_CH, src);
+    set_size(RP_M2M_WR_CH, &dst_info);
+    set_size(RP_M2M_RD_CH, &src_info);
+    set_mode(RP_M2M_WR_CH, 0u);
+    set_mode(RP_M2M_RD_CH, 0u);
+    rp_dmb();
+
+    if (*(volatile uint32_t *)(RP_M2M_RD_PBLOCK + 0xA0u) != (uint32_t)src ||
+        *(volatile uint32_t *)(RP_M2M_WR_PBLOCK + 0xA0u) != (uint32_t)out)
+    {
+        rc = -237;
+        goto out;
+    }
+
+    const uint32_t t0 = get_us_clock();
+    transfer_started = 1;
+    edmac_arm(RP_M2M_WR_CH);
+    edmac_arm(RP_M2M_RD_CH);
+    edmac_final_start_rd(RP_M2M_RD_CH);
+
+    while (!(rp_m2m_rd_done && rp_m2m_wr_done))
+    {
+        if ((uint32_t)(get_us_clock() - t0) >= RP_M2M_RECT_TIMEOUT_US)
+            break;
+        msleep(1);
+        rp_dmb();
+    }
+
+    const uint32_t dt = (uint32_t)(get_us_clock() - t0);
+    if (elapsed_us)
+        *elapsed_us = dt;
+
+    if (!(rp_m2m_rd_done && rp_m2m_wr_done))
+    {
+        rc = -238;
+        goto out;
+    }
+
+    rc = 0;
+
+out:
+    if (cbrs_registered)
+    {
+        unregister_complete(RP_M2M_WR_CH);
+        unregister_complete(RP_M2M_RD_CH);
+    }
+    if (boomer_configured)
+        stop_boomer(RP_M2M_WR_CH);
+
+    if (transfer_started && rc != 0)
+    {
+        edmac_reset(RP_M2M_WR_CH);
+        edmac_reset(RP_M2M_RD_CH);
+        rp_dmb();
+    }
+
+    rp_m2m_session_frames++;
+    if (rc != 0)
+        rp_m2m_session_errors++;
+    if (elapsed_us)
+    {
+        const uint32_t dt = *elapsed_us;
+        rp_m2m_session_sum_us += dt;
+        if (rp_m2m_session_min_us == 0 || dt < rp_m2m_session_min_us)
+            rp_m2m_session_min_us = dt;
+        if (dt > rp_m2m_session_max_us)
+            rp_m2m_session_max_us = dt;
+    }
+
+    if (rc != 0 || rp_m2m_session_frames <= 4u ||
+        (rp_m2m_session_frames & 31u) == 0u)
+    {
+        RP_BACKEND_TRACE("M2M33 frame=%d rc=%d rd=%d wr=%d us=%d src=%x dst=%x",
+                         (int)rp_m2m_session_frames, rc,
+                         (int)rp_m2m_rd_done, (int)rp_m2m_wr_done,
+                         elapsed_us ? (int)*elapsed_us : 0,
+                         (uint32_t)src, (uint32_t)out);
+    }
+
+    return rc;
+}
