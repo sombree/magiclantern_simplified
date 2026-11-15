@@ -331,3 +331,328 @@ static int rp_capture_allocation_size(uint32_t *alloc_size)
     rp_guard.allocated_per_slot = (uint32_t)bytes;
     return 0;
 }
+
+/* Only during capture preparation, before redirecting ch3. All accesses
+ * use the uncached DMA alias, so the guard is not hidden in the CPU cache. */
+static int rp_guard_seed_slot(int i)
+{
+    if (!rp_guard.enabled) return 0;
+    if (i < 0 || i >= rp_buf_count) return -1;
+    uint8_t *dma = (uint8_t *)(uintptr_t)rp_bufs[i].dma;
+    if (!dma || rp_guard.nominal16 < rp_guard.nominal) return -2;
+    uint64_t end = (uint64_t)rp_guard.nominal16 +
+                   RP_W3_GUARD_POST16_BYTES + RP_W3_GUARD_CHECK_BYTES;
+    /* The +256 pad also accommodates up to 63 bytes of alignment shift. */
+    if (end + RP_CAPTURE_ALIGN > rp_guard.allocated_per_slot) return -3;
+    memset(dma + rp_guard.nominal, RP_W3_GUARD_PATTERN,
+           (uint32_t)end - rp_guard.nominal);
+    rp_dmb();
+    return 0;
+}
+
+static int rp_guard_probe_slot(int slot)
+{
+    if (!rp_guard.enabled) return 0;
+    if (slot < 0 || slot >= rp_buf_count) return -1;
+    const volatile uint8_t *dma =
+        (const volatile uint8_t *)(uintptr_t)rp_bufs[slot].dma;
+    int nominal_changed=0, full16_changed=0, after16_changed=0;
+    for (uint32_t k=0;k<RP_W3_GUARD_CHECK_BYTES;k++)
+    {
+        if (dma[rp_guard.nominal+k] != RP_W3_GUARD_PATTERN) nominal_changed=1;
+        if (dma[rp_guard.nominal16+k] != RP_W3_GUARD_PATTERN) full16_changed=1;
+        if (dma[rp_guard.nominal16+RP_W3_GUARD_POST16_BYTES+k] !=
+            RP_W3_GUARD_PATTERN) after16_changed=1;
+    }
+    rp_guard.checked++;
+    if (nominal_changed)
+    {
+        if (!rp_guard.nominal_changed)
+            rp_guard.first_nominal_slot=(uint32_t)slot;
+        rp_guard.nominal_changed++;
+    }
+    if (full16_changed) rp_guard.full16_changed++;
+    if (after16_changed)
+    {
+        if (!rp_guard.after16_changed)
+            rp_guard.first_after16_slot=(uint32_t)slot;
+        rp_guard.after16_changed++;
+        /* Writes even after hypothetical full16 payload are a hard abort.
+         * Note: cannot recover an already-overrun memory transaction. */
+        rp_fatal=1;
+        rp_dmb();
+        return -2;
+    }
+    return 0;
+}
+
+int raw_vid_rp_transport_get_plan(struct rp_w3_transport_plan *out)
+{
+    if (!out) return -1;
+    if (!is_camera("RP", "1.6.0") || raw_info.width <= 0 ||
+        raw_info.height <= 0 || raw_info.pitch <= 0)
+        return -2;
+    /* For the current matrix the only confirmed LE16 mode is b0=1.
+     * Actual W3 pitch remains packed: THIS FUNCTION NEVER WRITES MMIO. */
+    const int le16 = rp_w3_matrix_case_active() &&
+        rp_w3_matrix_field_index() == 0 &&
+        rp_w3_matrix_field_value() == 1;
+    uint32_t usable = 0u;
+    /* v6.1: report the actual minimum usable capacity of all redirected
+     * allocations, measured from each 64-byte-aligned DMA start. The old
+     * formula subtracted BOTH the 256-byte allocation pad and 64-byte
+     * alignment, which incorrectly reported nominal_size - 64 despite
+     * successful allocations of nominal_size + 256.
+     *
+     * Do not count unallocated slots, never infer capacity from raw_info,
+     * and do not confuse this capacity with the hardware DMA byte count. */
+    if (rp_buf_count == RP_CAPTURE_BUFS && rp_guard.allocated_per_slot > 0u)
+    {
+        uint32_t min_usable = 0xffffffffu;
+        for (int i = 0; i < RP_CAPTURE_BUFS; i++)
+        {
+            if (!rp_bufs[i].alloc || !rp_bufs[i].dma)
+            {
+                min_usable = 0u;
+                break;
+            }
+            const uintptr_t base = (uintptr_t)rp_bufs[i].alloc;
+            const uint32_t alignment_offset =
+                (RP_CAPTURE_ALIGN - (uint32_t)(base & (RP_CAPTURE_ALIGN - 1u)))
+                 & (RP_CAPTURE_ALIGN - 1u);
+            if (alignment_offset >= rp_guard.allocated_per_slot)
+            {
+                min_usable = 0u;
+                break;
+            }
+            const uint32_t slot_usable =
+                rp_guard.allocated_per_slot - alignment_offset;
+            if (slot_usable < min_usable) min_usable = slot_usable;
+        }
+        usable = min_usable == 0xffffffffu ? 0u : min_usable;
+    }
+    return rp_w3_transport_make_plan(out, (uint32_t)raw_info.width,
+        (uint32_t)raw_info.height, (uint32_t)raw_info.bits_per_pixel,
+        le16, (uint32_t)raw_info.pitch, usable);
+}
+
+void raw_vid_rp_guard_get_status(struct rp_w3_guard_status *out)
+{
+    if (out) *out=rp_guard;
+}
+
+
+static void raw_vid_rp_ready_task(void);
+static void raw_vid_rp_steer_task(void);
+
+static inline void rp_dmb(void)
+{
+    /* RP-only control object is ARMv7-A/ARM state.  Canon's existing Complete
+     * callback-table slot points to rp_hot_thumb.c (RAM callback, no ROM hook). */
+    __asm__ volatile("dmb ish" ::: "memory");
+}
+
+static inline uint64_t rp_wall_us(void)
+{
+    return (uint64_t)get_us_clock();
+}
+
+typedef uint32_t (*rp_get_u32_fn)(void);
+
+static inline uint32_t rp_raw_get_buffer(void)
+{
+    return ((rp_get_u32_fn)RP_RAW_GET_BUFFER_THUMB)();
+}
+
+static inline uint32_t rp_raw_get_size(void)
+{
+    return ((rp_get_u32_fn)RP_RAW_GET_SIZE_THUMB)();
+}
+
+static inline uint32_t rp_rd32(uint32_t a)
+{
+    return *(volatile uint32_t *)(uintptr_t)a;
+}
+
+static inline void rp_wr32(uint32_t a, uint32_t v)
+{
+    *(volatile uint32_t *)(uintptr_t)a = v;
+}
+
+static inline int8_t rp_rd8s(uint32_t a)
+{
+    return *(volatile int8_t *)(uintptr_t)a;
+}
+
+static inline void rp_wr8(uint32_t a, uint8_t v)
+{
+    *(volatile uint8_t *)(uintptr_t)a = v;
+}
+
+static int rp_valid_ram_ptr(uint32_t p)
+{
+    return ((p & 3u) == 0u && p >= 0x1000u && p < 0xC0000000u);
+}
+
+static uint32_t rp_evf_raw(void)
+{
+    uint32_t base = rp_rd32(RP_EVFDEV_VRAM_BASE_LITERAL);
+    if (!rp_valid_ram_ptr(base))
+        return 0u;
+    return rp_rd32(base + 0xECu);
+}
+
+static int rp_read_mem1_geometry(struct rp_mem1_geometry *g)
+{
+    if (!g) return 0;
+    memset(g, 0, sizeof(*g));
+
+    uint32_t s = rp_rd32(RP_MEM1_STATE_PTR_LITERAL);
+    if (!rp_valid_ram_ptr(s))
+        return 0;
+
+    g->state = s;
+    g->mode = rp_rd32(s + RP_MEM1_MODE_OFF);
+    g->b_gate = rp_rd32(s + RP_MEM1_B_GATE_OFF);
+    g->d_gate = rp_rd32(s + RP_MEM1_D_GATE_OFF);
+    g->a_w = rp_rd32(s + RP_MEM1_A_W_OFF); g->a_h = rp_rd32(s + RP_MEM1_A_H_OFF);
+    g->b_w = rp_rd32(s + RP_MEM1_B_W_OFF); g->b_h = rp_rd32(s + RP_MEM1_B_H_OFF);
+    g->c_w = rp_rd32(s + RP_MEM1_C_W_OFF); g->c_h = rp_rd32(s + RP_MEM1_C_H_OFF);
+    g->d_w = rp_rd32(s + RP_MEM1_D_W_OFF); g->d_h = rp_rd32(s + RP_MEM1_D_H_OFF);
+    g->selected_w = rp_rd32(s + RP_MEM1_SELECTED_W_OFF);
+    g->selected_h = rp_rd32(s + RP_MEM1_SELECTED_H_OFF);
+
+    if (g->mode < 0x14u)
+    {
+        if (g->b_gate != 0u &&
+            (g->mode == 0x0Bu || g->mode == 0x0Fu || g->mode == 0x09u))
+        {
+            g->active_pair = 1u;
+            g->active_w_off = RP_MEM1_B_W_OFF; g->active_h_off = RP_MEM1_B_H_OFF;
+            g->active_w = g->b_w; g->active_h = g->b_h;
+        }
+        else
+        {
+            g->active_pair = 0u;
+            g->active_w_off = RP_MEM1_A_W_OFF; g->active_h_off = RP_MEM1_A_H_OFF;
+            g->active_w = g->a_w; g->active_h = g->a_h;
+        }
+    }
+    else if (g->mode == 0x1Bu && g->d_gate != 0u)
+    {
+        g->active_pair = 3u;
+        g->active_w_off = RP_MEM1_D_W_OFF; g->active_h_off = RP_MEM1_D_H_OFF;
+        g->active_w = g->d_w; g->active_h = g->d_h;
+    }
+    else
+    {
+        g->active_pair = 2u;
+        g->active_w_off = RP_MEM1_C_W_OFF; g->active_h_off = RP_MEM1_C_H_OFF;
+        g->active_w = g->c_w; g->active_h = g->c_h;
+    }
+    return 1;
+}
+
+static uint32_t rp_mnav_desc_base(uint32_t worktype, uint32_t flag2)
+{
+    if (worktype == 1u) return 0x334u;
+    if (worktype == 2u) return 0x4A4u;
+    if (worktype == 3u) return 0x784u;
+    if (worktype == 4u && flag2 != 0u) return 0x1C4u;
+    if (worktype == 5u) return 0x8F4u;
+    return 0x54u;
+}
+
+static int rp_read_mnav(struct rp_mnav_snapshot *m)
+{
+    if (!m) return 0;
+    memset(m, 0, sizeof(*m));
+
+    uint32_t state = rp_rd32(RP_MNAV_CONTROL);
+    uint32_t flag2 = rp_rd32(RP_MNAV_CONTROL + 0x08u);
+    uint32_t work = rp_rd32(RP_MNAV_CONTROL + 0x0Cu);
+    if (!rp_valid_ram_ptr(state)) return 0;
+
+    uint32_t desc = state + rp_mnav_desc_base(work, flag2) + RP_MNAV_LOW_ID * 0x10u;
+    if (!rp_valid_ram_ptr(desc)) return 0;
+
+    uint32_t pool = rp_rd32(desc + 0x00u);
+    if (pool >= 0x100u) return 0;
+    uint32_t pool_base_addr = state + pool * 4u + 4u;
+    if (!rp_valid_ram_ptr(pool_base_addr)) return 0;
+
+    m->state = state; m->worktype = work; m->flag2 = flag2; m->desc = desc;
+    m->pool = pool; m->offset = rp_rd32(desc + 0x04u);
+    m->stride = rp_rd32(desc + 0x08u); m->count = rp_rd32(desc + 0x0Cu);
+    m->read_idx = (int32_t)rp_rd8s(state + 0x24u + RP_MNAV_LOW_ID * 2u);
+    m->write_idx = (int32_t)rp_rd8s(state + 0x25u + RP_MNAV_LOW_ID * 2u);
+    m->pool_base = rp_rd32(pool_base_addr);
+    m->predicted_write = m->pool_base + m->offset +
+                         m->stride * (uint32_t)m->write_idx;
+    return 1;
+}
+
+static int rp_chain_is(uint32_t dma)
+{
+    return dma != 0u &&
+           rp_rd32(RP_MNAV_PROVIDER_SLOT) == dma &&
+           rp_evf_raw() == dma &&
+           rp_rd32(RP_MEM1_CURRENT_BUFFER_SLOT) == dma &&
+           rp_rd32(RP_RAW_PBLOCK + 0xA0u) == dma;
+}
+
+static int rp_find_free_capture_buffer(void)
+{
+    for (int i = 0; i < rp_buf_count; i++)
+        if (rp_bufs[i].state == RPBUF_FREE)
+            return i;
+    return -1;
+}
+
+static void rp_mnav_write_offset(uint32_t dma)
+{
+    if (!rp_mnav_valid || !rp_mnav.desc || !rp_mnav.pool_base)
+        return;
+    rp_wr32(rp_mnav.desc + 0x04u, dma - rp_mnav.pool_base);
+    rp_dmb();
+    rp_steer_desc_writes++;
+}
+
+static void rp_mnav_restore_original(void)
+{
+    if (!rp_mnav_valid) return;
+    rp_wr32(rp_mnav.desc + 0x00u, rp_mnav_desc_original[0]);
+    rp_wr32(rp_mnav.desc + 0x04u, rp_mnav_desc_original[1]);
+    rp_wr32(rp_mnav.desc + 0x08u, rp_mnav_desc_original[2]);
+    rp_wr32(rp_mnav.desc + 0x0Cu, rp_mnav_desc_original[3]);
+    rp_wr8(rp_mnav.state + 0x24u + RP_MNAV_LOW_ID * 2u,
+           (uint8_t)rp_mnav_read_original);
+    rp_wr8(rp_mnav.state + 0x25u + RP_MNAV_LOW_ID * 2u,
+           (uint8_t)rp_mnav_write_original);
+    rp_dmb();
+}
+
+static void rp_m2m_complete_cbr(void *ctx)
+{
+    uintptr_t which = (uintptr_t)ctx;
+
+    /* IRQ/Complete context: no logging, no task/semaphore/FIO calls. */
+    if (which == 1u)
+        rp_m2m_rd_done = 1;
+    else if (which == 2u)
+        rp_m2m_wr_done = 1;
+
+    __asm__ volatile("dmb ish" ::: "memory");
+}
+
+static uint8_t *rp_m2m_align_ptr(void *p)
+{
+    uintptr_t q = (uintptr_t)p;
+    q = (q + RP_M2M_ALIGN - 1u) & ~(uintptr_t)(RP_M2M_ALIGN - 1u);
+    return (uint8_t *)UNCACHEABLE((void *)q);
+}
+
+static inline uint32_t rp_complete_slot_read(void)
+{
+    return *(volatile uint32_t *)RP_COMPLETE_SLOT;
+}
