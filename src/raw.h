@@ -151,6 +151,13 @@ int raw_lv_enabled();
 /* redirect the LV RAW EDMAC in order to write the raw data at "ptr" */
 void raw_lv_redirect_edmac(void* ptr);
 
+/* DIGIC 8 bring-up: install/query the already-validated Canon EDMAC pBlock.
+ * This deliberately accepts a pBlock address, not a legacy channel number. */
+#if defined(CONFIG_DIGIC_8X) || defined(MODULE)
+void raw_lv_set_edmac_channel_addr(uint32_t addr);
+uint32_t raw_lv_get_edmac_channel_addr(void);
+#endif
+
 /* cut the right part of the LV raw image (makes buffer smaller); may reduce DMA load */
 /* returns the value actually used (or 0 if it doesn't work) */
 int raw_lv_shave_right(int offset);

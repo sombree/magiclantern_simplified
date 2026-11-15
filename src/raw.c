@@ -136,8 +136,42 @@ static int (*dual_iso_get_dr_improvement)() = MODULE_FUNCTION(dual_iso_get_dr_im
 
 
 #ifdef CONFIG_RAW_LIVEVIEW
-// volatile because this points at some OS managed MMIO
-static volatile struct edmac_mmio *raw_lv_edmac = (struct edmac_mmio *)RAW_LV_EDMAC_CHANNEL_ADDR;
+/*
+ * Traditional RAW LV capture redirects Canon's active write port.
+ *
+ * Older ports hard-code RAW_LV_EDMAC_CHANNEL_ADDR.  On DIGIC 8 this is
+ * unsafe to guess: the real port MMIO block is model-specific and may be
+ * outside the old 0xC0F0xxxx map.  Allow D8 ports to provide it at runtime
+ * after a read-only / Canon-call-based discovery step.
+ */
+#if defined(RAW_LV_EDMAC_CHANNEL_ADDR)
+static volatile struct edmac_mmio *raw_lv_edmac =
+    (struct edmac_mmio *)RAW_LV_EDMAC_CHANNEL_ADDR;
+#elif defined(CONFIG_DIGIC_8X)
+static volatile struct edmac_mmio *raw_lv_edmac = 0;
+#else
+#error "CONFIG_RAW_LIVEVIEW requires RAW_LV_EDMAC_CHANNEL_ADDR on this platform"
+#endif
+
+#if defined(CONFIG_DIGIC_8X)
+void raw_lv_set_edmac_channel_addr(uint32_t addr)
+{
+    /*
+     * D8 pBlock addresses are supplied only after the platform has identified
+     * the active RAW-LV port.  Keep the check deliberately conservative:
+     * known D8 imaging EDMAC blocks live in device space (0xD...).
+     */
+    if ((addr & 0xF0000000) == 0xD0000000 && (addr & 0xFF) == 0)
+        raw_lv_edmac = (volatile struct edmac_mmio *)addr;
+    else
+        raw_lv_edmac = 0;
+}
+
+uint32_t raw_lv_get_edmac_channel_addr(void)
+{
+    return (uint32_t)raw_lv_edmac;
+}
+#endif
 #endif
 
 #endif  /* no CONFIG_EDMAC_RAW_SLURP */
@@ -694,7 +728,14 @@ static int raw_lv_buffer_size = 0;
 static void* raw_get_default_lv_buffer()
 {
 #if !defined(CONFIG_EDMAC_RAW_SLURP)
+    if (!raw_lv_edmac) return 0;
+    #if defined(CONFIG_DIGIC_8X)
+    /* pBlock is the live Canon EDMAC register block; avoid RP's temporary
+     * shamem_read override and read only the already-validated active port. */
+    return CACHEABLE(raw_lv_edmac->ram_addr);
+    #else
     return CACHEABLE(shamem_read((uint32_t)&(raw_lv_edmac->ram_addr)));
+    #endif
 #else
     return CACHEABLE(raw_lv_buffer);
 #endif
@@ -764,8 +805,19 @@ static int raw_lv_get_resolution(int* width, int* height)
 
 #else // ~CONFIG_EDMAC_RAW_SLURP
     /* autodetect raw size from EDMAC */
-    uint32_t lv_raw_height = shamem_read((uint32_t)&(raw_lv_edmac->yn_xn)); // yn_xn??  For height??
-    uint32_t lv_raw_size = shamem_read((uint32_t)&(raw_lv_edmac->yb_xb));
+    if (!raw_lv_edmac) return 0;
+
+    uint32_t lv_raw_height;
+    uint32_t lv_raw_size;
+    #if defined(CONFIG_DIGIC_8X)
+    /* D8: read only the active, platform-validated pBlock.  Blind scans of
+     * guessed EDMAC ranges are not safe on these cameras. */
+    lv_raw_height = raw_lv_edmac->yn_xn;
+    lv_raw_size   = raw_lv_edmac->yb_xb;
+    #else
+    lv_raw_height = shamem_read((uint32_t)&(raw_lv_edmac->yn_xn)); // yn_xn??  For height??
+    lv_raw_size   = shamem_read((uint32_t)&(raw_lv_edmac->yb_xb));
+    #endif
     if (!lv_raw_size) return 0;
 
     int pitch = lv_raw_size & 0xFFFF;
@@ -1057,6 +1109,17 @@ int raw_update_params_work()
         // Horizontal y="8" height="32"
         skip_top    = 16;
         skip_left   = 100;
+        #endif
+
+        #ifdef CONFIG_RP
+        /*
+         * EOS RP 1.6.0 RAW-LV optical-black margins observed during the
+         * channel-3 bring-up.  These are deliberately conservative and keep
+         * the black-level sampler in the left OB area.  Recorder crop offsets
+         * are independent from these values.
+         */
+        skip_top    = 44;
+        skip_left   = 120;
         #endif
 
         #if defined(CONFIG_70D)
@@ -1370,11 +1433,17 @@ int raw_update_params_work()
          * so we do this by compensating the white level manually
          * warning: this may exceed 16383!
          */
+        /* SHAD_GAIN_REGISTER is a platform-specific legacy/D6+ MMIO/shamem
+         * detail.  EOS RP does not have a validated address yet, so keep the
+         * photo-LV DR path but skip only this optional white-level correction
+         * unless the platform explicitly provides the register. */
+        #ifdef SHAD_GAIN_REGISTER
         int shad_gain = shamem_read(SHAD_GAIN_REGISTER);
 
         raw_info.white_level -= raw_info.black_level;
         raw_info.white_level = raw_info.white_level * 3444 / shad_gain; /* 0.25 EV correction, so LiveView matches CR2 exposure */
         raw_info.white_level += raw_info.black_level;
+        #endif
 
         /* in photo LiveView, ISO is not the one selected from Canon menu,
          * so the computed dynamic range has nothing to do with the one from CR2 pics
@@ -2118,7 +2187,8 @@ void FAST raw_lv_redirect_edmac(void* ptr)
     #ifdef CONFIG_EDMAC_RAW_SLURP
     redirected_raw_buffer = (void*) CACHEABLE(ptr);
     #else
-    raw_lv_edmac->ram_addr = (uint32_t)CACHEABLE(ptr);
+    if (raw_lv_edmac)
+        raw_lv_edmac->ram_addr = (uint32_t)CACHEABLE(ptr);
     #endif
 }
 
@@ -2609,6 +2679,23 @@ void raw_lv_request_bpp(int bpp)
 {
     take_semaphore(raw_sem, 0);
 
+#if defined(CONFIG_DIGIC_8X)
+    /*
+     * No D8 PACK32 register ABI has been validated for ML yet.  Canon raw LV
+     * comes up as the native 14-bit stream, which is exactly what raw_vidx
+     * currently records.  Do not touch guessed MMIO to request 10/12/16-bit.
+     */
+    if (bpp != 14)
+        dbg_printf("D8 raw LV: %d bpp request ignored (14-bit only)\n", bpp);
+    raw_info.bits_per_pixel = 14;
+    if (raw_info.width > 0)
+    {
+        raw_info.pitch = raw_info.width * raw_info.bits_per_pixel / 8;
+        raw_info.frame_size = raw_info.pitch * raw_info.height;
+    }
+    give_semaphore(raw_sem);
+    return;
+#else
     /* raw bit depth setup is done from PACK32_MODE register (mask 0x131) */
     #if defined(CONFIG_DIGIC_45)
         const uint32_t PACK32_MODE = 0xC0F08094;
@@ -2663,6 +2750,7 @@ void raw_lv_request_bpp(int bpp)
     }
 
     give_semaphore(raw_sem);
+#endif /* !CONFIG_DIGIC_8X */
 }
 
 void raw_lv_request_digital_gain(int gain)
