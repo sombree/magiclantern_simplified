@@ -2068,3 +2068,226 @@ out:
 
     return rc;
 }
+
+/* One-shot real-frame RP mem2mem crop used by bring-up stage 32.
+ *
+ * This deliberately duplicates the already hardware-proven Esub1 transaction
+ * rather than refactoring raw_vid_rp_probe_m2m() before the real-RAW test.
+ * Source is a completed ch3 capture-ring frame; destination is the 0x80-aligned
+ * VIDF payload returned by write_video_frame_header().  The caller must keep
+ * the source capture slot QUEUED until this function returns.
+ */
+static int rp_m2m_crop_wire_once(const void *src_frame, uint32_t src_pitch,
+                              uint32_t crop_x, uint32_t crop_y,
+                              uint32_t crop_w, uint32_t crop_h,
+                              void *dst, uint32_t dst_size,
+                              uint32_t *elapsed_us, uint32_t wire_bpp)
+{
+    typedef void *(*res_create_fn)(uint32_t *, uint32_t);
+    typedef void (*res_lock_fn)(void *);
+    typedef void (*res_unlock_fn)(void);
+    typedef void (*res_destroy_fn)(void *);
+    typedef void (*ch_fn)(uint32_t);
+    typedef void (*boomer_select_fn)(uint32_t, uint32_t);
+    typedef void (*register_cbr_fn)(int, void (*)(void *), void *);
+    struct rp_d8_edmac_info_once
+    {
+        uint32_t off1s;
+        uint32_t off1a;
+        uint32_t off1b;
+        uint32_t off2s;
+        uint32_t off2a;
+        uint32_t off2b;
+        uint32_t off3;
+        uint32_t xs;
+        uint32_t xa;
+        uint32_t xb;
+        uint32_t ys;
+        uint32_t ya;
+        uint32_t yb;
+        uint32_t xn;
+        uint32_t yn;
+    };
+    typedef void (*set_addr_fn)(uint32_t, void *);
+    typedef void (*set_size_fn)(uint32_t, struct rp_d8_edmac_info_once *);
+    typedef void (*set_mode_fn)(uint32_t, uint32_t);
+
+    static uint32_t resources[2] = { 0x000100ADu, 0x000100BBu };
+
+    if (!is_camera("RP", "1.6.0") || !src_frame || !dst)
+        return -200;
+    if (!crop_w || !crop_h || src_pitch == 0)
+        return -201;
+
+    const uint32_t row_bytes = crop_w * wire_bpp / 8u;
+    const uint32_t src_x_bytes = ((crop_x + 7u) / 8u) * wire_bpp;
+    const uint32_t src_y = (crop_y / 2u) * 2u;
+    const uint32_t payload = row_bytes * crop_h;
+
+    if (row_bytes == 0 || src_x_bytes + row_bytes > src_pitch)
+        return -202;
+    if (payload > dst_size)
+        return -203;
+    if (src_y + crop_h > (uint32_t)raw_info.height)
+        return -204;
+
+    uint8_t *src = (uint8_t *)UNCACHEABLE(src_frame)
+                 + src_y * src_pitch + src_x_bytes;
+    uint8_t *out = (uint8_t *)UNCACHEABLE(dst);
+
+    /* The proven RP path only needs word alignment.  Current real geometry is
+     * stronger: source crop start is 0x40-aligned and VIDF payload is 0x80-aligned. */
+    if ((((uintptr_t)src | (uintptr_t)out) & 3u) != 0)
+        return -205;
+
+    res_create_fn res_create = RP_THUMB_FN(RP_FN_RES_CREATE, res_create_fn);
+    res_lock_fn res_lock = RP_THUMB_FN(RP_FN_RES_LOCK, res_lock_fn);
+    res_unlock_fn res_unlock = RP_THUMB_FN(RP_FN_RES_UNLOCK, res_unlock_fn);
+    res_destroy_fn res_destroy = RP_THUMB_FN(RP_FN_RES_DESTROY, res_destroy_fn);
+    ch_fn edmac_reset = RP_THUMB_FN(RP_FN_EDMAC_RESET, ch_fn);
+    ch_fn edmac_final_start_rd = RP_THUMB_FN(RP_FN_EDMAC_FINAL_START_RD, ch_fn);
+    register_cbr_fn register_complete =
+        RP_THUMB_FN(RP_FN_EDMAC_REGISTER_COMPLETE, register_cbr_fn);
+    ch_fn unregister_complete =
+        RP_THUMB_FN(RP_FN_EDMAC_UNREGISTER_COMPLETE, ch_fn);
+    ch_fn boomer_reset = RP_THUMB_FN(RP_FN_BOOMER_RESET, ch_fn);
+    boomer_select_fn boomer_select =
+        RP_THUMB_FN(RP_FN_BOOMER_SELECT, boomer_select_fn);
+    ch_fn stop_boomer = RP_THUMB_FN(RP_FN_EDMAC_STOP_BOOMER, ch_fn);
+    ch_fn reset_pack = RP_THUMB_FN(RP_FN_EDMAC_RESET_PACK, ch_fn);
+    ch_fn edmac_arm = RP_THUMB_FN(RP_FN_EDMAC_ARM, ch_fn);
+    set_addr_fn set_address = RP_THUMB_FN(RP_FN_EDMAC_SET_ADDRESS, set_addr_fn);
+    set_size_fn set_size = RP_THUMB_FN(RP_FN_EDMAC_SET_SIZE, set_size_fn);
+    set_mode_fn set_mode = RP_THUMB_FN(RP_FN_EDMAC_SET_MODE, set_mode_fn);
+
+    void *lock = NULL;
+    int locked = 0;
+    int cbrs_registered = 0;
+    int boomer_configured = 0;
+    int rc = -206;
+
+    struct rp_d8_edmac_info_once src_info = {0};
+    struct rp_d8_edmac_info_once dst_info = {0};
+    src_info.off1b = src_pitch - row_bytes;
+    src_info.xb = row_bytes;
+    src_info.yb = crop_h - 1u;
+    dst_info.off1b = 0;
+    dst_info.xb = row_bytes;
+    dst_info.yb = crop_h - 1u;
+
+    RP_BACKEND_TRACE("REAL32 cfg src=%x dst=%x pitch=%d row=%d rows=%d off=%d a=%d/%d",
+                     (uint32_t)src, (uint32_t)out, (int)src_pitch,
+                     (int)row_bytes, (int)crop_h, (int)src_info.off1b,
+                     (int)((uintptr_t)src & 0x7fu),
+                     (int)((uintptr_t)out & 0x7fu));
+
+    lock = res_create(resources, 2u);
+    if (!lock)
+    {
+        rc = -207;
+        goto out;
+    }
+    res_lock(lock);              /* RP E07267AC: WakeSubChips-like wrapper. */
+    locked = 1;
+
+    edmac_reset(RP_M2M_WR_CH);
+    edmac_reset(RP_M2M_RD_CH);
+    boomer_reset(RP_M2M_WR_CH);
+    boomer_select(RP_M2M_WR_CH, RP_M2M_BOOMER_SELECTOR);
+    boomer_configured = 1;
+
+    rp_m2m_rd_done = 0;
+    rp_m2m_wr_done = 0;
+    rp_dmb();
+
+    register_complete((int)RP_M2M_WR_CH, rp_m2m_complete_cbr, (void *)2u);
+    register_complete((int)RP_M2M_RD_CH, rp_m2m_complete_cbr, (void *)1u);
+    cbrs_registered = 1;
+
+    reset_pack(RP_M2M_WR_CH);
+    reset_pack(RP_M2M_RD_CH);
+
+    set_address(RP_M2M_WR_CH, out);
+    set_address(RP_M2M_RD_CH, src);
+    set_size(RP_M2M_WR_CH, &dst_info);
+    set_size(RP_M2M_RD_CH, &src_info);
+    set_mode(RP_M2M_WR_CH, 0u);
+    set_mode(RP_M2M_RD_CH, 0u);
+    rp_dmb();
+
+    if (*(volatile uint32_t *)(RP_M2M_RD_PBLOCK + 0xA0u) != (uint32_t)src ||
+        *(volatile uint32_t *)(RP_M2M_WR_PBLOCK + 0xA0u) != (uint32_t)out)
+    {
+        rc = -208;
+        goto out;
+    }
+
+    const uint32_t t0 = get_us_clock();
+    edmac_arm(RP_M2M_WR_CH);
+    edmac_arm(RP_M2M_RD_CH);
+    edmac_final_start_rd(RP_M2M_RD_CH);
+
+    while (!(rp_m2m_rd_done && rp_m2m_wr_done))
+    {
+        if ((uint32_t)(get_us_clock() - t0) >= RP_M2M_RECT_TIMEOUT_US)
+            break;
+        msleep(1);
+        rp_dmb();
+    }
+
+    const uint32_t dt = (uint32_t)(get_us_clock() - t0);
+    if (elapsed_us)
+        *elapsed_us = dt;
+
+    RP_BACKEND_TRACE("REAL32 complete rd=%d wr=%d us=%d",
+                     (int)rp_m2m_rd_done, (int)rp_m2m_wr_done, (int)dt);
+
+    if (!(rp_m2m_rd_done && rp_m2m_wr_done))
+    {
+        rc = -209;
+        goto out;
+    }
+
+    rc = 0;
+
+out:
+    if (cbrs_registered)
+    {
+        unregister_complete(RP_M2M_WR_CH);
+        unregister_complete(RP_M2M_RD_CH);
+    }
+    if (boomer_configured)
+        stop_boomer(RP_M2M_WR_CH);
+
+    /*
+     * v7: one-shot R46/W13 transfers must leave hardware idle even after
+     * success.  The old path reset channels only on failure, allowing the
+     * completed configuration to persist into the next operation/session.
+     */
+    edmac_reset(RP_M2M_WR_CH);
+    edmac_reset(RP_M2M_RD_CH);
+    rp_dmb();
+
+    if (locked)
+        res_unlock();            /* RP E07267B2: SuspendSubChips-like wrapper. */
+    if (lock)
+        res_destroy(lock);
+
+    if (rc == 0)
+    {
+        uint32_t dt = elapsed_us ? *elapsed_us : 0;
+        rp_m2m_session_frames++;
+        rp_m2m_session_sum_us += dt;
+        if (!rp_m2m_session_min_us || dt < rp_m2m_session_min_us)
+            rp_m2m_session_min_us = dt;
+        if (dt > rp_m2m_session_max_us)
+            rp_m2m_session_max_us = dt;
+    }
+    else
+    {
+        rp_m2m_session_errors++;
+    }
+
+    RP_BACKEND_TRACE("REAL32 END rc=%d", rc);
+    return rc;
+}
