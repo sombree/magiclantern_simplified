@@ -4985,15 +4985,41 @@ static void worker(void)
     SEND_LOG_DATA_STR("Raw video worker stopping.\n");
 }
 
-void init_worker(struct msg_queue *q)
+int init_worker(struct msg_queue *q)
 {
     event_q = q;
     edmac_sem = create_named_semaphore("edmac_raw_worker", SEM_CREATE_UNLOCKED);
     if (edmac_sem == NULL)
     {
         SEND_LOG_DATA_STR("ERROR: worker could not create edmac sem\n");
-        return;
+        return -1;
     }
+
+    rp_slot_sem = create_named_semaphore("raw_slot_meta", SEM_CREATE_UNLOCKED);
+    if (rp_slot_sem == NULL)
+    {
+        SEND_LOG_DATA_STR("ERROR: worker could not create slot metadata sem\n");
+        return -2;
+    }
+
+    if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 36)
+    {
+        RP_START_TRACE("REC111 writer queue request depth=%d", RP_V110_WRITE_QUEUE_MAX + 2);
+        rp_write_q = msg_queue_create("raw_write_q", RP_V110_WRITE_QUEUE_MAX + 2);
+        if (rp_write_q == NULL)
+        {
+            SEND_LOG_DATA_STR("ERROR: worker could not create RP writer queue\n");
+            return -3;
+        }
+
+        /* Keep the stage36 scheduling constraint: writer priority 0x11, not
+         * the legacy 200D-oriented 0x9.  v3C changes output buffering/writer only. */
+        task_create("raw_writer", WORKER_PRIO, 0x1000, rp_writer_task, NULL);
+        RP_START_TRACE("S36 WR persistent task created prio=%x", WORKER_PRIO);
+    }
+
+    RP_START_TRACE("REC111 worker queue=%x writer=%x", (uint32_t)event_q, (uint32_t)rp_write_q);
     task_create("raw_v_worker", WORKER_PRIO, 0x1000, worker, NULL);
     allow_recording();
+    return 0;
 }
