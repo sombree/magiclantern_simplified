@@ -1296,3 +1296,509 @@ static int rp_geometry_supported(void)
         return 1;
     return 0;
 }
+
+static int rp_crop_supported_at(uint32_t x, uint32_t y,
+                                uint32_t w, uint32_t h)
+{
+    if (!w || !h || (w & 7u) || (h & 1u))
+        return 0;
+    if (x + w > (uint32_t)raw_info.width)
+        return 0;
+    if (y + h > (uint32_t)raw_info.height)
+        return 0;
+
+    /* Packed-pixel crop starts must remain byte-exact for all supported BPP.
+     * The fixed x=192 origin and Full x=0 both satisfy this. */
+    if (((x * (uint32_t)raw_info.bits_per_pixel) & 7u) != 0)
+        return 0;
+
+    return 1;
+}
+
+static int rp_crop_supported(uint32_t w, uint32_t h)
+{
+    return rp_crop_supported_at(RP_RAW_VID_CROP_X, RP_RAW_VID_CROP_Y, w, h);
+}
+
+
+/*
+ * RP native MemoryToMemoryEsub1 bring-up probe.
+ *
+ * Stage 19: resource lock only.
+ * Stage 20: + RD46/WR13 reset, Boomer select, Complete CBR registration.
+ * Stage 21: + source/destination addresses, 4 KiB geometry, mode 0.
+ * Stage 22: + actual one-shot 4 KiB transfer and byte-for-byte verification.
+ * Stage 23: synthetic RAW-like 2D geometry/stride configuration, no start;
+ *           NO large CPU prefill, and channels are explicitly reset before
+ *           releasing resources/buffers.
+ * Stage 24: large synthetic-buffer initialization only (cacheable writes +
+ *           selective dcache clean), NO EDMAC setup.
+ * Stage 25: actual 2240-byte x 720-row transfer and full verification.
+ *
+ * This deliberately does NOT use generic ML SetEDmac/StartEDmac overrides:
+ * those remain no-op placeholders on the current RP port.  It also avoids the
+ * high-level EFsVcopy wrapper because its production geometry descriptor lives
+ * in Canon runtime RAM (E1236544).  Instead this follows the exact low-level
+ * Esub1 sequence recovered from RP firmware, with our own tiny descriptors.
+ */
+int raw_vid_rp_probe_m2m(int stage)
+{
+    typedef void *(*res_create_fn)(uint32_t *, uint32_t);
+    typedef void (*res_lock_fn)(void *);
+    typedef void (*res_unlock_fn)(void);
+    typedef void (*res_destroy_fn)(void *);
+    typedef void (*ch_fn)(uint32_t);
+    typedef void (*boomer_select_fn)(uint32_t, uint32_t);
+    typedef void (*register_cbr_fn)(int, void (*)(void *), void *);
+    /* IMPORTANT: ML modules are built with -DMODULE but without the per-camera
+     * CONFIG_DIGIC_VIII/CONFIG_DIGIC_8X defines.  Therefore src/edmac.h exposes
+     * the legacy 11-word edmac_info layout here, while Canon D8 E057C364 reads
+     * a 15-word descriptor.  Keep an RP-local ABI-exact D8 descriptor instead
+     * of relying on struct edmac_info in module code. */
+    struct rp_d8_edmac_info
+    {
+        uint32_t off1s;
+        uint32_t off1a;
+        uint32_t off1b;
+        uint32_t off2s;
+        uint32_t off2a;
+        uint32_t off2b;
+        uint32_t off3;
+        uint32_t xs;
+        uint32_t xa;
+        uint32_t xb;
+        uint32_t ys;
+        uint32_t ya;
+        uint32_t yb;
+        uint32_t xn;
+        uint32_t yn;
+    };
+
+    typedef void (*set_addr_fn)(uint32_t, void *);
+    typedef void (*set_size_fn)(uint32_t, struct rp_d8_edmac_info *);
+    typedef void (*set_mode_fn)(uint32_t, uint32_t);
+
+    static uint32_t resources[2] = { 0x000100ADu, 0x000100BBu };
+
+    res_create_fn res_create = RP_THUMB_FN(RP_FN_RES_CREATE, res_create_fn);
+    res_lock_fn res_lock = RP_THUMB_FN(RP_FN_RES_LOCK, res_lock_fn);
+    res_unlock_fn res_unlock = RP_THUMB_FN(RP_FN_RES_UNLOCK, res_unlock_fn);
+    res_destroy_fn res_destroy = RP_THUMB_FN(RP_FN_RES_DESTROY, res_destroy_fn);
+    ch_fn edmac_reset = RP_THUMB_FN(RP_FN_EDMAC_RESET, ch_fn);
+    ch_fn edmac_final_start_rd = RP_THUMB_FN(RP_FN_EDMAC_FINAL_START_RD, ch_fn);
+    register_cbr_fn register_complete =
+        RP_THUMB_FN(RP_FN_EDMAC_REGISTER_COMPLETE, register_cbr_fn);
+    ch_fn unregister_complete =
+        RP_THUMB_FN(RP_FN_EDMAC_UNREGISTER_COMPLETE, ch_fn);
+    ch_fn boomer_reset = RP_THUMB_FN(RP_FN_BOOMER_RESET, ch_fn);
+    boomer_select_fn boomer_select =
+        RP_THUMB_FN(RP_FN_BOOMER_SELECT, boomer_select_fn);
+    ch_fn stop_boomer = RP_THUMB_FN(RP_FN_EDMAC_STOP_BOOMER, ch_fn);
+    ch_fn reset_pack = RP_THUMB_FN(RP_FN_EDMAC_RESET_PACK, ch_fn);
+    ch_fn edmac_arm = RP_THUMB_FN(RP_FN_EDMAC_ARM, ch_fn);
+    set_addr_fn set_address = RP_THUMB_FN(RP_FN_EDMAC_SET_ADDRESS, set_addr_fn);
+    set_size_fn set_size = RP_THUMB_FN(RP_FN_EDMAC_SET_SIZE, set_size_fn);
+    set_mode_fn set_mode = RP_THUMB_FN(RP_FN_EDMAC_SET_MODE, set_mode_fn);
+
+    void *src_alloc = NULL;
+    void *dst_alloc = NULL;
+    uint8_t *src = NULL;
+    uint8_t *dst = NULL;
+    void *lock = NULL;
+    int locked = 0;
+    int cbrs_registered = 0;
+    int boomer_configured = 0;
+    int channels_configured = 0;
+    int transfer_started = 0;
+    int rc = -1;
+
+    if (stage < 19 || stage > 31)
+        return -100;
+
+    const int rect_probe = (stage >= 23);
+    const int matrix_probe = (stage >= 26);
+
+    uint32_t rect_pitch = RP_M2M_RECT_SRC_PITCH;
+    uint32_t rect_row_bytes = RP_M2M_RECT_ROW_BYTES;
+    uint32_t rect_rows = RP_M2M_RECT_ROWS;
+    uint32_t rect_xoff = RP_M2M_RECT_XOFF;
+    uint32_t rect_yoff = RP_M2M_RECT_YOFF;
+    uint32_t rect_guard = RP_M2M_RECT_GUARD;
+
+    if (matrix_probe)
+    {
+        rect_row_bytes = RP_M2M_MATRIX_ROW_BYTES;
+        rect_xoff = 0;
+        rect_yoff = 0;
+        rect_guard = RP_M2M_MATRIX_GUARD;
+
+        switch (stage)
+        {
+            case 26: rect_rows = 2;   rect_pitch = rect_row_bytes; break;
+            case 27: rect_rows = 2;   rect_pitch = RP_M2M_MATRIX_GAP_PITCH; break;
+            case 28: rect_rows = 64;  rect_pitch = rect_row_bytes; break;
+            case 29: rect_rows = 64;  rect_pitch = RP_M2M_MATRIX_GAP_PITCH; break;
+            case 30: rect_rows = 720; rect_pitch = rect_row_bytes; break;
+            case 31: rect_rows = 720; rect_pitch = RP_M2M_MATRIX_GAP_PITCH; break;
+            default: return -100;
+        }
+    }
+
+    const uint32_t rect_dst_bytes = rect_row_bytes * rect_rows;
+    const uint32_t rect_src_span =
+        (rect_yoff + rect_rows) * rect_pitch + rect_xoff;
+    const uint32_t src_span = rect_probe ? rect_src_span : RP_M2M_BYTES;
+    const uint32_t dst_span = rect_probe ? (rect_dst_bytes + rect_guard) : RP_M2M_BYTES;
+
+    src_alloc = fio_malloc(src_span + RP_M2M_ALIGN);
+    dst_alloc = fio_malloc(dst_span + RP_M2M_ALIGN);
+    if (!src_alloc || !dst_alloc)
+    {
+        rc = -101;
+        goto out;
+    }
+
+    uint8_t *src_base = rp_m2m_align_ptr(src_alloc);
+    dst = rp_m2m_align_ptr(dst_alloc);
+
+    if (rect_probe)
+    {
+        src = src_base + rect_yoff * rect_pitch + rect_xoff;
+        RP_BACKEND_TRACE("M2M S%d RECT alloc base=%x src=%x dst=%x", stage,
+                         (uint32_t)src_base, (uint32_t)src, (uint32_t)dst);
+        RP_BACKEND_TRACE("M2M S%d RECT pitch=%d row=%d rows=%d xoff=%d yoff=%d", stage,
+                         (int)rect_pitch, (int)rect_row_bytes,
+                         (int)rect_rows, (int)rect_xoff, (int)rect_yoff);
+        if (matrix_probe)
+        {
+            RP_BACKEND_TRACE("M2M S%d MATRIX gap=%d p16=%d p64=%d bytes=%d", stage,
+                             (int)(rect_pitch - rect_row_bytes),
+                             (int)(rect_pitch & 15u), (int)(rect_pitch & 63u),
+                             (int)rect_dst_bytes);
+        }
+
+        /* IMPORTANT DIAGNOSTIC DIFFERENCE FROM v11i:
+         * Do not byte-fill ~7 MB through fio_malloc's UNCACHEABLE alias on the
+         * high-priority raw_v_worker task.  That test itself can starve Canon.
+         * Stage 23 needs no payload at all.  Stages 24/25 prepare data through
+         * the cacheable alias, then clean exactly those ranges for DMA. */
+        if (stage >= 24)
+        {
+            uint8_t *src_cpu = (uint8_t *)CACHEABLE(src_base);
+            uint8_t *dst_cpu = (uint8_t *)CACHEABLE(dst);
+
+            RP_BACKEND_TRACE("M2M S%d RECT init begin bytes=%d/%d", stage,
+                             (int)src_span, (int)dst_span);
+
+            memset(dst_cpu, 0xA5, dst_span);
+
+            /* Distinct value per logical crop row catches a wrong stride while
+             * touching only the 1.61 MB payload, not every skipped source byte. */
+            for (uint32_t y = 0; y < rect_rows; y++)
+            {
+                uint8_t v = (uint8_t)((0x31u + y * 29u) & 0xFFu);
+                uint8_t *row = src_cpu +
+                    (rect_yoff + y) * rect_pitch + rect_xoff;
+                memset(row, v, rect_row_bytes);
+                if ((y & 63u) == 63u)
+                    msleep(1);
+            }
+
+            dcache_clean((uint32_t)src_cpu, src_span);
+            dcache_clean((uint32_t)dst_cpu, dst_span);
+            rp_dmb();
+            RP_BACKEND_TRACE("M2M S%d RECT init PASS", stage);
+        }
+
+        if (stage == 24)
+        {
+            rc = 0;
+            goto out;
+        }
+    }
+    else
+    {
+        src = src_base;
+        for (uint32_t i = 0; i < src_span; i++)
+            src_base[i] = (uint8_t)((i * 37u + (i >> 3) * 11u + 0x5Au) & 0xFFu);
+        for (uint32_t i = 0; i < dst_span; i++)
+            dst[i] = 0xCCu;
+        RP_BACKEND_TRACE("M2M S%d alloc src=%x dst=%x n=%d",
+                         stage, (uint32_t)src, (uint32_t)dst, (int)RP_M2M_BYTES);
+    }
+
+    /* Exact EFsVcopy resource pair / create+lock path. */
+    lock = res_create(resources, 2u);
+    if (!lock)
+    {
+        rc = -102;
+        goto out;
+    }
+    res_lock(lock);
+    locked = 1;
+    RP_BACKEND_TRACE("M2M S%d resource lock PASS lock=%x", stage, (uint32_t)lock);
+
+    if (stage == 19)
+    {
+        rc = 0;
+        goto out;
+    }
+
+    /* Exact E0738BAC channel/Boomer setup for RD46 / WR13. */
+    edmac_reset(RP_M2M_WR_CH);
+    edmac_reset(RP_M2M_RD_CH);
+    boomer_reset(RP_M2M_WR_CH);
+    boomer_select(RP_M2M_WR_CH, RP_M2M_BOOMER_SELECTOR);
+    boomer_configured = 1;
+
+    rp_m2m_rd_done = 0;
+    rp_m2m_wr_done = 0;
+    rp_dmb();
+
+    register_complete((int)RP_M2M_WR_CH, rp_m2m_complete_cbr, (void *)2u);
+    register_complete((int)RP_M2M_RD_CH, rp_m2m_complete_cbr, (void *)1u);
+    cbrs_registered = 1;
+
+    reset_pack(RP_M2M_WR_CH);
+    reset_pack(RP_M2M_RD_CH);
+
+    RP_BACKEND_TRACE("M2M S%d setup PASS rd=%d wr=%d sel=%x",
+                     stage, (int)RP_M2M_RD_CH, (int)RP_M2M_WR_CH,
+                     RP_M2M_BOOMER_SELECTOR);
+
+    if (stage == 20)
+    {
+        rc = 0;
+        goto out;
+    }
+
+    struct rp_d8_edmac_info src_info = {0};
+    struct rp_d8_edmac_info dst_info = {0};
+    if (rect_probe)
+    {
+        src_info.off1b = rect_pitch - rect_row_bytes;
+        src_info.xb = rect_row_bytes;
+        src_info.yb = rect_rows - 1u;
+        dst_info.off1b = 0;
+        dst_info.xb = rect_row_bytes;
+        dst_info.yb = rect_rows - 1u;
+    }
+    else
+    {
+        src_info.xb = RP_M2M_BYTES;
+        src_info.yb = 0;
+        dst_info.xb = RP_M2M_BYTES;
+        dst_info.yb = 0;
+    }
+
+    RP_BACKEND_TRACE("M2M S%d desc legacy=%d d8=%d xn=%d/%d yn=%d/%d",
+                     stage, (int)sizeof(struct edmac_info),
+                     (int)sizeof(struct rp_d8_edmac_info),
+                     (int)src_info.xn, (int)dst_info.xn,
+                     (int)src_info.yn, (int)dst_info.yn);
+
+    /* Exact E0738D86 + E0738DA0 ordering: WR first, then RD. */
+    RP_BACKEND_TRACE("M2M S%d cfg address begin", stage);
+    set_address(RP_M2M_WR_CH, dst);
+    set_address(RP_M2M_RD_CH, src);
+    RP_BACKEND_TRACE("M2M S%d cfg size begin", stage);
+    set_size(RP_M2M_WR_CH, &dst_info);
+    RP_BACKEND_TRACE("M2M S%d cfg size WR PASS", stage);
+    set_size(RP_M2M_RD_CH, &src_info);
+    RP_BACKEND_TRACE("M2M S%d cfg size RD PASS", stage);
+    set_mode(RP_M2M_WR_CH, 0u);
+    set_mode(RP_M2M_RD_CH, 0u);
+    channels_configured = 1;
+    RP_BACKEND_TRACE("M2M S%d cfg mode PASS", stage);
+    rp_dmb();
+
+    uint32_t wr_addr = *(volatile uint32_t *)(RP_M2M_WR_PBLOCK + 0xA0u);
+    uint32_t rd_addr = *(volatile uint32_t *)(RP_M2M_RD_PBLOCK + 0xA0u);
+    RP_BACKEND_TRACE("M2M S%d config PASS rd_a=%x wr_a=%x rd_xb=%x wr_xb=%x",
+                     stage, rd_addr, wr_addr,
+                     *(volatile uint32_t *)(RP_M2M_RD_PBLOCK + 0x50u),
+                     *(volatile uint32_t *)(RP_M2M_WR_PBLOCK + 0x50u));
+    if (rect_probe)
+    {
+        RP_BACKEND_TRACE("M2M S%d RECT geom soff=%d sxb=%d syb=%d doff=%d dxb=%d dyb=%d",
+                         stage, (int)src_info.off1b, (int)src_info.xb,
+                         (int)src_info.yb, (int)dst_info.off1b,
+                         (int)dst_info.xb, (int)dst_info.yb);
+        RP_BACKEND_TRACE("M2M S%d RECT regs rd50=%x rd68=%x wr50=%x wr68=%x", stage,
+                         *(volatile uint32_t *)(RP_M2M_RD_PBLOCK + 0x50u),
+                         *(volatile uint32_t *)(RP_M2M_RD_PBLOCK + 0x68u),
+                         *(volatile uint32_t *)(RP_M2M_WR_PBLOCK + 0x50u),
+                         *(volatile uint32_t *)(RP_M2M_WR_PBLOCK + 0x68u));
+    }
+
+    if (rd_addr != (uint32_t)src || wr_addr != (uint32_t)dst)
+    {
+        rc = -103;
+        goto out;
+    }
+
+    if (stage == 21 || stage == 23)
+    {
+        rc = 0;
+        goto out;
+    }
+
+    /* E0738CB6: arm WR, arm RD, then final RD kick/connect. */
+    uint32_t t0 = get_us_clock();
+    transfer_started = 1;
+    edmac_arm(RP_M2M_WR_CH);
+    edmac_arm(RP_M2M_RD_CH);
+    edmac_final_start_rd(RP_M2M_RD_CH);
+
+    const uint32_t timeout_us = matrix_probe ? RP_M2M_MATRIX_TIMEOUT_US :
+                                (rect_probe ? RP_M2M_RECT_TIMEOUT_US : RP_M2M_TIMEOUT_US);
+    while (!(rp_m2m_rd_done && rp_m2m_wr_done))
+    {
+        if ((uint32_t)(get_us_clock() - t0) >= timeout_us)
+            break;
+        msleep(1);
+        rp_dmb();
+    }
+
+    uint32_t dt = (uint32_t)(get_us_clock() - t0);
+    RP_BACKEND_TRACE("M2M S%d complete rd=%d wr=%d us=%d",
+                     stage, (int)rp_m2m_rd_done, (int)rp_m2m_wr_done, (int)dt);
+
+    if (!(rp_m2m_rd_done && rp_m2m_wr_done))
+    {
+        rc = -104;
+        goto out;
+    }
+
+    uint32_t mismatches = 0;
+    uint32_t first_bad = 0xFFFFFFFFu;
+    uint32_t guard_bad = 0;
+
+    if (rect_probe)
+    {
+        /* The old diagnostic verifier walked uncached src+dst byte-by-byte.
+         * Runtime logs show that this alone costs ~55-58 ms for only 143 KiB;
+         * extrapolated to 1.61 MiB it can monopolize raw_v_worker for >0.5 s
+         * and make a successful DMA transfer look like a camera freeze.
+         *
+         * All current matrix rows are 4-byte aligned (2240-byte row and both
+         * 2240/6524 pitches are divisible by 4), so compare 32-bit words and
+         * yield periodically.  On an unequal word, fall back to byte checks so
+         * the reported mismatch count/first offset remain byte-exact. */
+        const uint32_t verify_t0 = get_us_clock();
+        RP_BACKEND_TRACE("M2M S%d verify begin bytes=%d", stage, (int)rect_dst_bytes);
+        msleep(1);
+
+        for (uint32_t y = 0; y < rect_rows; y++)
+        {
+            const uint8_t *srow = src + y * rect_pitch;
+            const uint8_t *drow = dst + y * rect_row_bytes;
+            const uint32_t words = rect_row_bytes >> 2;
+            const uint32_t *sw = (const uint32_t *)srow;
+            const uint32_t *dw = (const uint32_t *)drow;
+
+            for (uint32_t w = 0; w < words; w++)
+            {
+                if (sw[w] != dw[w])
+                {
+                    uint32_t x0 = w << 2;
+                    for (uint32_t b = 0; b < 4u; b++)
+                    {
+                        uint32_t x = x0 + b;
+                        if (srow[x] != drow[x])
+                        {
+                            uint32_t off = y * rect_row_bytes + x;
+                            if (first_bad == 0xFFFFFFFFu)
+                                first_bad = off;
+                            mismatches++;
+                        }
+                    }
+                }
+            }
+
+            /* Current row size is divisible by four.  Keep a tail path so the
+             * verifier stays correct if a later probe uses another width. */
+            for (uint32_t x = words << 2; x < rect_row_bytes; x++)
+            {
+                if (srow[x] != drow[x])
+                {
+                    uint32_t off = y * rect_row_bytes + x;
+                    if (first_bad == 0xFFFFFFFFu)
+                        first_bad = off;
+                    mismatches++;
+                }
+            }
+
+            if (((y + 1u) % RP_M2M_VERIFY_YIELD_ROWS) == 0u)
+                msleep(1);
+        }
+
+        for (uint32_t i = 0; i < rect_guard; i++)
+            if (dst[rect_dst_bytes + i] != 0xA5u)
+                guard_bad++;
+
+        const uint32_t verify_dt = (uint32_t)(get_us_clock() - verify_t0);
+        RP_BACKEND_TRACE("M2M S%d verify end us=%d bad=%d first=%x guard=%d", stage,
+                         (int)verify_dt, (int)mismatches, first_bad, (int)guard_bad);
+        RP_BACKEND_TRACE("M2M S%d samples s0=%x d0=%x sN=%x dN=%x", stage,
+                         (uint32_t)src[0], (uint32_t)dst[0],
+                         (uint32_t)src[(rect_rows - 1u) * rect_pitch + rect_row_bytes - 1u],
+                         (uint32_t)dst[rect_dst_bytes - 1u]);
+        rc = (mismatches || guard_bad) ? -105 : 0;
+    }
+    else
+    {
+        for (uint32_t i = 0; i < RP_M2M_BYTES; i++)
+        {
+            if (src[i] != dst[i])
+            {
+                if (first_bad == 0xFFFFFFFFu)
+                    first_bad = i;
+                mismatches++;
+            }
+        }
+
+        RP_BACKEND_TRACE("M2M S22 verify bad=%d first=%x s0=%x d0=%x sN=%x dN=%x",
+                         (int)mismatches, first_bad,
+                         (uint32_t)src[0], (uint32_t)dst[0],
+                         (uint32_t)src[RP_M2M_BYTES - 1u],
+                         (uint32_t)dst[RP_M2M_BYTES - 1u]);
+        rc = mismatches ? -105 : 0;
+    }
+
+out:
+    /* Mirror Canon/M50 Esub1 teardown.  On pre-start probe stages these calls
+     * merely remove the CBRs / selected Boomer state installed above. */
+    if (cbrs_registered)
+    {
+        unregister_complete(RP_M2M_WR_CH);
+        unregister_complete(RP_M2M_RD_CH);
+    }
+    if (boomer_configured)
+        stop_boomer(RP_M2M_WR_CH);
+
+    /* Canon/M50 normally tear down only after a completed transfer.  Stage 23
+     * is intentionally configuration-only, so explicitly reset both channels
+     * before freeing their backing buffers / releasing the resource lock.
+     * Also reset on any failed/timeout transfer. */
+    if (channels_configured && (!transfer_started || rc != 0))
+    {
+        edmac_reset(RP_M2M_WR_CH);
+        edmac_reset(RP_M2M_RD_CH);
+        rp_dmb();
+        RP_BACKEND_TRACE("M2M S%d cleanup reset PASS", stage);
+    }
+
+    if (locked)
+        res_unlock();
+    if (lock)
+        res_destroy(lock);
+
+    if (src_alloc)
+        fio_free(src_alloc);
+    if (dst_alloc)
+        fio_free(dst_alloc);
+
+    RP_BACKEND_TRACE("M2M S%d END rc=%d", stage, rc);
+    return rc;
+}
