@@ -652,6 +652,296 @@ static struct rp_frame_slot *rp_get_free_frame_slot(void)
     rp_slot_unlock();
     return out;
 }
+
+/* Try to give the unused tail of a just-compressed slot to the following
+ * FREE/RESERVED metadata entries, as mlv_lite::shrink_slot() does.
+ *
+ * Return 1 if the physical region was shrunk, 0 if it deliberately stayed at
+ * its old size because the next region is busy, <0 on invalid input.
+ *
+ * The "deferred" case is safe: slot->used is still the exact on-disk VIDF
+ * size, so the writer simply cannot coalesce across the RAM-only gap.  No
+ * memory is lost and free_slot() later restores the full region. */
+static int rp_shrink_frame_slot_locked(uint32_t i, uint32_t new_size)
+{
+    if (i >= rp_frame_slot_count ||
+        rp_frame_slots[i].state != RP_FRAME_SLOT_CAPTURING ||
+        new_size == 0u || (new_size & (RP_FRAME_SLOT_ALIGN - 1u)))
+    {
+        return -1;
+    }
+
+    uint32_t old_size = rp_slot_region_size_locked(i);
+    if (new_size > old_size)
+        return -2;
+    if (new_size == old_size)
+        return 1;
+
+    uint32_t diff = old_size - new_size;
+    char *old_end = rp_frame_slots[i].end;
+
+    int linked =
+        (i + 1u < rp_frame_slot_count) &&
+        (rp_frame_slots[i + 1u].chunk_index == rp_frame_slots[i].chunk_index) &&
+        (rp_frame_slots[i + 1u].state == RP_FRAME_SLOT_FREE ||
+         rp_frame_slots[i + 1u].state == RP_FRAME_SLOT_RESERVED) &&
+        (rp_frame_slots[i + 1u].start == old_end);
+
+    if (!linked)
+    {
+        rp_slot_shrink_deferred++;
+        return 0;
+    }
+
+    rp_frame_slots[i].end = rp_frame_slots[i].start + new_size;
+    rp_frame_slots[i + 1u].start -= diff;
+
+    /* Normalize as many following regions as metadata allows.  A FREE entry
+     * may temporarily be larger than max stride only if there is no following
+     * FREE/RESERVED descriptor able to receive its excess; that is still a
+     * valid capture region and will be normalized on its next shrink/free. */
+    uint32_t j = i + 1u;
+    while (j < rp_frame_slot_count &&
+           rp_frame_slots[j].chunk_index == rp_frame_slots[i].chunk_index)
+    {
+        uint32_t sz = rp_slot_region_size_locked(j);
+        if (sz < rp_frame_slot_stride)
+        {
+            rp_frame_slots[j].state = RP_FRAME_SLOT_RESERVED;
+            break;
+        }
+
+        rp_frame_slots[j].state = RP_FRAME_SLOT_FREE;
+        if (sz == rp_frame_slot_stride)
+            break;
+
+        uint32_t excess = sz - rp_frame_slot_stride;
+        char *old_j_end = rp_frame_slots[j].end;
+        int next_linked =
+            (j + 1u < rp_frame_slot_count) &&
+            (rp_frame_slots[j + 1u].chunk_index == rp_frame_slots[j].chunk_index) &&
+            (rp_frame_slots[j + 1u].state == RP_FRAME_SLOT_FREE ||
+             rp_frame_slots[j + 1u].state == RP_FRAME_SLOT_RESERVED) &&
+            (rp_frame_slots[j + 1u].start == old_j_end);
+
+        if (!next_linked)
+            break;
+
+        rp_frame_slots[j].end = rp_frame_slots[j].start + rp_frame_slot_stride;
+        rp_frame_slots[j + 1u].start -= excess;
+        j++;
+    }
+
+    rp_slot_shrink_ok++;
+    uint32_t reserved = rp_count_reserved_frame_slots_locked();
+    if (reserved > rp_slot_reserved_peak)
+        rp_slot_reserved_peak = reserved;
+    return 1;
+}
+
+static int rp_shrink_frame_slot(struct rp_frame_slot *slot, uint32_t new_size)
+{
+    int i = rp_slot_index(slot);
+    if (i < 0 || rp_slot_lock())
+        return -1;
+    int rc = rp_shrink_frame_slot_locked((uint32_t)i, new_size);
+    rp_slot_unlock();
+    return rc;
+}
+
+/* mlv_lite-style free_slot().
+ *
+ * Merge the just-freed variable region with adjacent FREE/RESERVED regions
+ * from the same Canon memSuite chunk, then repartition that address range into
+ * full max-size FREE slots followed by zero/partial RESERVED descriptors. */
+static void rp_free_frame_slot_locked(uint32_t slot_index)
+{
+    if (slot_index >= rp_frame_slot_count)
+        return;
+
+    struct rp_frame_slot *slot = &rp_frame_slots[slot_index];
+    slot->used = 0;
+    slot->state = RP_FRAME_SLOT_RESERVED;
+
+    uint32_t start = slot_index;
+    while (start > 0u)
+    {
+        struct rp_frame_slot *prev = &rp_frame_slots[start - 1u];
+        struct rp_frame_slot *cur = &rp_frame_slots[start];
+        if (prev->chunk_index != cur->chunk_index ||
+            (prev->state != RP_FRAME_SLOT_FREE &&
+             prev->state != RP_FRAME_SLOT_RESERVED) ||
+            cur->start != prev->end)
+        {
+            break;
+        }
+        start--;
+    }
+
+    uint32_t end = slot_index;
+    while (end + 1u < rp_frame_slot_count)
+    {
+        struct rp_frame_slot *cur = &rp_frame_slots[end];
+        struct rp_frame_slot *next = &rp_frame_slots[end + 1u];
+        if (next->chunk_index != cur->chunk_index ||
+            (next->state != RP_FRAME_SLOT_FREE &&
+             next->state != RP_FRAME_SLOT_RESERVED) ||
+            next->start != cur->end)
+        {
+            break;
+        }
+        end++;
+    }
+
+    char *start_ptr = rp_frame_slots[start].start;
+    char *end_ptr = rp_frame_slots[end].end;
+    char *ptr = start_ptr;
+
+    for (uint32_t i = start; i <= end; i++)
+    {
+        rp_frame_slots[i].start = ptr;
+        rp_frame_slots[i].used = 0;
+
+        uint32_t remaining = (uint32_t)(end_ptr - ptr);
+        if (remaining >= rp_frame_slot_stride)
+        {
+            rp_frame_slots[i].end = ptr + rp_frame_slot_stride;
+            rp_frame_slots[i].state = RP_FRAME_SLOT_FREE;
+            ptr += rp_frame_slot_stride;
+        }
+        else
+        {
+            /* First remainder descriptor owns all residual bytes.  Any later
+             * reserved descriptors are zero-sized at the physical end. */
+            rp_frame_slots[i].end = end_ptr;
+            rp_frame_slots[i].state = RP_FRAME_SLOT_RESERVED;
+            ptr = end_ptr;
+        }
+    }
+
+    rp_slot_free_rebuilds++;
+    uint32_t reserved = rp_count_reserved_frame_slots_locked();
+    if (reserved > rp_slot_reserved_peak)
+        rp_slot_reserved_peak = reserved;
+}
+
+static void rp_abandon_frame_slot(struct rp_frame_slot *slot)
+{
+    int i = rp_slot_index(slot);
+    if (i < 0 || rp_slot_lock())
+        return;
+    rp_free_frame_slot_locked((uint32_t)i);
+    rp_slot_unlock();
+}
+
+static void rp_clear_frame_slot_metadata(void)
+{
+    for (uint32_t c = 0; c < RP_FRAME_CHUNK_MAX; c++)
+    {
+        rp_frame_chunks[c]._buf = NULL;
+        rp_frame_chunks[c].start = NULL;
+        rp_frame_chunks[c].bytes = 0;
+        rp_frame_chunks[c].first_slot = 0;
+        rp_frame_chunks[c].slot_count = 0;
+    }
+
+    for (uint32_t i = 0; i < RP_FRAME_SLOT_MAX; i++)
+    {
+        rp_frame_slots[i].start = NULL;
+        rp_frame_slots[i].end = NULL;
+        rp_frame_slots[i].used = 0;
+        rp_frame_slots[i].frame_number = 0;
+        rp_frame_slots[i].chunk_index = 0;
+        rp_frame_slots[i].chunk_pos = 0;
+        rp_frame_slots[i].state = RP_FRAME_SLOT_UNUSED;
+    }
+
+    rp_crx_ref_slot = NULL;
+    rp_crx_ref_width = 0;
+    rp_crx_ref_height = 0;
+    rp_crx_ref_bits = 0;
+    rp_crx_ref_row_bytes = 0;
+    rp_crx_ref_payload_bytes = 0;
+    rp_crx_ref_frame_number = 0;
+    rp_crx_ref_copy_us = 0;
+
+    rp_frame_slot_count = 0;
+    rp_frame_chunk_count = 0;
+    rp_frame_slot_cursor = 0;
+    rp_v112_last_capture = RP_FRAME_SLOT_MAX;
+    rp_v112_tail_hits = rp_v112_fallbacks = 0u;
+    rp_frame_slot_stride = 0;
+    rp_frame_suite_bytes = 0;
+    rp_frame_suite_chunks = 0;
+    rp_frame_output_bytes = 0;
+    rp_frame_waste_bytes = 0;
+    rp_slot_shrink_ok = 0;
+    rp_slot_shrink_deferred = 0;
+    rp_slot_free_rebuilds = 0;
+    rp_slot_reserved_peak = 0;
+}
+
+static void rp_free_frame_slots(void)
+{
+    /* Do not return any provider while a writer may still dereference it.
+     * On uncertainty preserve memory and reject all new sessions this boot. */
+    if ((rp_frame_suite != NULL || rp_v110_mem3[0] != NULL ||
+         rp_v110_mem3[1] != NULL || rp_v110_ssraw_addr != 0u) &&
+        (rp_writer_jobs_queued != rp_writer_jobs_done ||
+         rp_header_write_pending || rp_writer_storage_lockout ||
+         rp_writer_io_fail || rp_writer_post_fail))
+    {
+        rp_v110_owner_quarantine = 1;
+        rp_writer_storage_lockout = 1;
+        RP_START_TRACE("SS110 QUARANTINE pending=%d header=%d io=%d post=%d",
+                       (int)(rp_writer_jobs_queued-rp_writer_jobs_done),
+                       (int)rp_header_write_pending,
+                       (int)rp_writer_io_fail,(int)rp_writer_post_fail);
+        return;
+    }
+#if RP_V110_SSRAM_OUTPUT
+    if (rp_v110_ssraw_addr)
+    {
+        int rc = rp_ssraw_v110_release();
+        RP_START_TRACE("SS110 SRM release rc=%d state=%d",rc,(int)rp_ssraw_v110_state());
+        if (rc)
+        {
+            /* Pending native free is not cancellation; the CORE is resident.
+             * Preserve other arenas too, and forbid later recording. */
+            rp_v110_owner_quarantine = 1;
+            rp_writer_storage_lockout = 1;
+            return;
+        }
+        rp_v110_ssraw_addr = rp_v110_ssraw_bytes = 0;
+    }
+#endif
+    for (int i = 1; i >= 0; --i)
+    {
+        if (rp_v110_mem3[i] != NULL)
+        {
+            shoot_free_suite(rp_v110_mem3[i]);
+            rp_v110_mem3[i] = NULL;
+        }
+    }
+
+    /* Slots are only views into one Canon shoot-memory suite.  Never free
+     * individual dynamic regions; release the suite exactly once. */
+    if (rp_frame_suite != NULL)
+    {
+        shoot_free_suite(rp_frame_suite);
+        rp_frame_suite = NULL;
+    }
+
+    rp_clear_frame_slot_metadata();
+}
+
+static uint32_t rp_calc_frame_slot_stride(uint32_t payload_size)
+{
+    /* Maximum physical region reserved for one in-flight frame.  Actual CRX
+     * VIDF blocks are shrunk to sector-aligned blockSize after encode. */
+    uint32_t minimum = EDMAC_ALIGNMENT + payload_size;
+    return ALIGN_UP(minimum, RP_FRAME_SLOT_ALIGN);
+}
 static void alloc_crop_bufs(struct crop_buf crop_bufs[])
 {
     if (crop_bufs[0]._buf != NULL
