@@ -283,3 +283,323 @@ static inline void rp_crx_barrier(void)
 {
     __asm__ volatile("dmb" ::: "memory");
 }
+
+static int rp_crx_ram_ptr(uint32_t ptr);
+static int rp_crx_bank_snapshot(uint32_t manager, uint32_t id,
+                                struct rp_crx_bank_snapshot *s);
+static int rp_crx_snapshot_arena_valid(const struct rp_crx_bank_snapshot *s);
+static void rp_crx_free_complete_cb(uint32_t opaque, uint32_t status);
+static int rp_crx_v22_try_reclaim(uint32_t path);
+
+/* Keep each synthetic BPP on a different Canon RAW-like D encoder bank.
+ * output111/v12 static audit: type 0/4/5 all map through the same RAW class
+ * field (1); downstream INIT_D/D_CONFIG/DIRECT_START/header logic does not
+ * distinguish 4/5, while type 0 is the already runtime-proven baseline. */
+static int rp_crx_select_bank(uint32_t bits, uint32_t *type, uint32_t *enc_id)
+{
+    if (!type || !enc_id)
+        return -1;
+
+    switch (bits)
+    {
+        case 14u:
+            *type = RP_CRX_DESC_TYPE_14BIT;
+            *enc_id = RP_CRX_ENCODER_ID_14BIT;
+            return 0;
+        case 12u:
+            *type = RP_CRX_DESC_TYPE_12BIT;
+            *enc_id = RP_CRX_ENCODER_ID_12BIT;
+            return 0;
+        case 10u:
+            *type = RP_CRX_DESC_TYPE_10BIT;
+            *enc_id = RP_CRX_ENCODER_ID_10BIT;
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+/* Canon-native D-route matrix:
+ *   RAW full pair   : types 0/1 -> IDs 0/1
+ *   CRAW full pair  : types 2/3 -> IDs 2/3
+ *   RAW crop pair   : types 4/5 -> IDs 8/9
+ *   CRAW crop pair  : types 6/7 -> IDs 10/11
+ *
+ * raw_vidx already uses 0/4/5 as independent lossless 14/12/10-bit banks.
+ * C-RAW therefore uses the paired codec-family routes 2/6/7 for 14/12/10-bit.
+ * Type2/ID2/mode3 is runtime-proven on custom 14-bit W3 input; type6/type7
+ * share the same StartDEncode/source/ROI ABI and are validated by result
+ * profile + exact CMP1 before any frame reaches the writer. */
+static int rp_crx_select_route(uint32_t bits, int lossy,
+                               uint32_t *type, uint32_t *enc_id)
+{
+    if (!lossy)
+        return rp_crx_select_bank(bits, type, enc_id);
+    if (!type || !enc_id)
+        return -1;
+
+    switch (bits)
+    {
+        case 14u:
+            *type = RP_CRAW_DESC_TYPE_14BIT;
+            *enc_id = RP_CRAW_ENCODER_ID_14BIT;
+            return 0;
+        case 12u:
+            *type = RP_CRAW_DESC_TYPE_12BIT;
+            *enc_id = RP_CRAW_ENCODER_ID_12BIT;
+            return 0;
+        case 10u:
+            *type = RP_CRAW_DESC_TYPE_10BIT;
+            *enc_id = RP_CRAW_ENCODER_ID_10BIT;
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+
+static int rp_crx_v22_pick_free_route(uint32_t manager, uint32_t bits, int lossy,
+                                      uint32_t *type, uint32_t *enc_id)
+{
+    if (!type || !enc_id || !rp_crx_ram_ptr(manager))
+        return -1;
+
+    const struct rp_crx_route *routes = lossy ? g_v22_craw_routes : g_v22_lossless_routes;
+    uint32_t count = lossy
+        ? (uint32_t)(sizeof(g_v22_craw_routes) / sizeof(g_v22_craw_routes[0]))
+        : (uint32_t)(sizeof(g_v22_lossless_routes) / sizeof(g_v22_lossless_routes[0]));
+
+    /* Dynamic policy is intentionally BPP-independent.  Select the first
+     * truly free physical D route in the codec family; descriptor.bits carries
+     * 10/12/14 independently.  After a successful tail reclaim the just-used
+     * lowest route becomes latch-0 again and is naturally reused for a later
+     * BPP, demonstrating the v62 TYPE_MAP result rather than preserving the
+     * historical per-BPP mapping. */
+    for (uint32_t i = 0u; i < count; i++)
+    {
+        struct rp_crx_bank_snapshot b;
+        if (rp_crx_bank_snapshot(manager, routes[i].id, &b) != 0 ||
+            !rp_crx_snapshot_arena_valid(&b) ||
+            b.mode != RP_CRX_MODE_LOSSLESS ||
+            b.latch != 0u || b.hw_active != 0u ||
+            g_encoder_bank_bits[routes[i].id] != 0u)
+            continue;
+        *type = routes[i].type;
+        *enc_id = routes[i].id;
+        return 0;
+    }
+
+    (void)bits;
+    return -2;
+}
+
+static int rp_crx_route_for_session(uint32_t bits, int lossy,
+                                    uint32_t *type, uint32_t *enc_id)
+{
+    if (!g_route_valid || bits != g_route_bits ||
+        (uint32_t)(lossy ? 1 : 0) != g_route_lossy ||
+        !type || !enc_id)
+        return -1;
+    *type = g_route_type;
+    *enc_id = g_route_id;
+    return 0;
+}
+
+/* v20 READ-ONLY policy probe.  The public StartEncode ABI takes a descriptor
+ * type, not an explicit encoder ID.  Runtime has proven only these three
+ * type->ID routes.  v20 therefore computes the first currently-free route
+ * from this KNOWN pool, but does NOT use it for submission.  In particular,
+ * type/BPP decoupling is still unproven and must be closed by v61 before an
+ * active dynamic-ID build. */
+struct rp_crx_known_route
+{
+    uint32_t type;
+    uint32_t id;
+};
+
+static const struct rp_crx_known_route g_v20_known_routes[] =
+{
+    /* TYPE_MAP @ E024CB80, D branch only.  Types 8/9 use a distinct
+     * manager-init selector (MovieDS in observed Canon use), and 10/11
+     * enter Q mode, so v20.1 deliberately excludes them. */
+    { 0u,  0u },
+    { 1u,  1u },
+    { 2u,  2u },
+    { 3u,  3u },
+    { 4u,  8u },
+    { 5u,  9u },
+    { 6u, 10u },
+    { 7u, 11u },
+};
+
+static int rp_crx_v20_pick_known_free(uint32_t manager, uint32_t bits,
+                                      uint32_t legacy_type, uint32_t legacy_id,
+                                      uint32_t *pick_type, uint32_t *pick_id)
+{
+    if (!pick_type || !pick_id || !rp_crx_ram_ptr(manager))
+        return -1;
+
+    /* Passive runtime correlation for v62.  manager+0x1C is the manager
+     * semaphore handle seen in algsmgrChangeMode; 0x1B96C is the global
+     * holding LOW_D_ALLOC's semaphore handle.  Read only. */
+    uint32_t mgr_sem = *(volatile uint32_t *)(uintptr_t)(manager + 0x1cu);
+    uint32_t low_sem = *(volatile uint32_t *)(uintptr_t)RP_CRX_LOW_ALLOC_SEM_SLOT;
+    RP_CRX_TRACE("V20 LOCKS mgrsem=%x lowsem=%x same=%d READ_ONLY",
+                 mgr_sem,low_sem,(int)(mgr_sem != 0u && mgr_sem == low_sem));
+
+    for (unsigned i = 0; i < sizeof(g_v20_known_routes)/sizeof(g_v20_known_routes[0]); i++)
+    {
+        uint32_t id = g_v20_known_routes[i].id;
+        struct rp_crx_bank_snapshot b;
+        if (rp_crx_bank_snapshot(manager, id, &b) ||
+            !rp_crx_snapshot_arena_valid(&b) ||
+            b.mode != RP_CRX_MODE_LOSSLESS)
+            continue;
+
+        /* A free latch plus no live HW lease is the minimum candidate rule.
+         * Stale workspace pointers are allowed in this dry-run because the
+         * future architecture intentionally reinitializes a released slot. */
+        if (b.latch == 0u && b.hw_active == 0u)
+        {
+            unsigned stale = 0;
+            for (unsigned k = 0; k < 5; k++)
+                if (b.pointers[k]) stale++;
+            *pick_type = g_v20_known_routes[i].type;
+            *pick_id = id;
+            RP_CRX_TRACE("V20 PICK D0_7 bits=%d id=%d type=%d stale=%d legacy=%d/%d READ_ONLY",
+                         (int)bits,(int)id,(int)*pick_type,(int)stale,
+                         (int)legacy_id,(int)legacy_type);
+            if (id != legacy_id || *pick_type != legacy_type)
+                RP_CRX_TRACE("V20 PICK differs_from_legacy: type/BPP decoupling UNPROVEN");
+            return 0;
+        }
+    }
+
+    RP_CRX_TRACE("V20 PICK BLOCK no free D0_7 route bits=%d legacy=%d/%d",
+                 (int)bits,(int)legacy_id,(int)legacy_type);
+    return -2;
+}
+
+static uint32_t rp_crx_hw_latch(uint32_t manager, uint32_t enc_id)
+{
+    if (manager < 0x1000u || manager >= 0xE0000000u ||
+        (manager & 3u) || enc_id >= RP_CRX_ALGSMGR_LATCH_COUNT)
+        return 0xffffffffu;
+
+    return *(volatile uint32_t *)(uintptr_t)
+        (manager + RP_CRX_ALGSMGR_LATCH_OFFSET + enc_id * 4u);
+}
+
+/* Pointer provenance from output148/output149; do not probe guessed MMIO.
+ * A zero/implausible backend or context is a hard failure for v14's write.
+ * These reads do not establish exclusive ownership of the Canon arena. */
+static int rp_crx_ram_ptr(uint32_t ptr)
+{
+    return ptr >= 0x1000u && ptr < 0xC0000000u && (ptr & 3u) == 0u;
+}
+
+static int rp_crx_bank_snapshot(uint32_t manager, uint32_t id,
+                                struct rp_crx_bank_snapshot *s)
+{
+    if (!s || !rp_crx_ram_ptr(manager) || id >= RP_CRX_ALGSMGR_LATCH_COUNT)
+        return -1;
+    memset(s, 0, sizeof(*s));
+    s->backend = *(volatile uint32_t *)(uintptr_t)RP_CRX_BACKEND_SLOT;
+    if (!rp_crx_ram_ptr(s->backend))
+        return -2;
+    volatile uint32_t *b = (volatile uint32_t *)(uintptr_t)s->backend;
+    s->arena_base = b[2];             /* backend+0x08 */
+    s->arena_size = b[3];             /* backend+0x0c */
+    s->cursor = b[5];                 /* backend+0x14 */
+    uint32_t ctx_base = b[10];        /* backend+0x28 */
+    if (!rp_crx_ram_ptr(ctx_base) ||
+        ctx_base > 0xBFFFFFFFu - (RP_CRX_ALGSMGR_LATCH_COUNT * RP_CRX_CONTEXT_STRIDE))
+        return -3;
+    s->context = ctx_base + id * RP_CRX_CONTEXT_STRIDE;
+    volatile uint32_t *c = (volatile uint32_t *)(uintptr_t)s->context;
+    s->pointers[0] = c[3];            /* context+0x0c */
+    s->pointers[1] = c[4];            /* context+0x10 */
+    s->pointers[2] = c[5];            /* context+0x14 */
+    s->pointers[3] = c[6];            /* context+0x18 */
+    s->pointers[4] = c[7];            /* context+0x1c */
+    s->hw_active = c[0x280 / 4];
+    s->latch = rp_crx_hw_latch(manager, id);
+    s->mode = *(volatile uint32_t *)(uintptr_t)(manager + RP_CRX_ALGSMGR_MODE_OFFSET);
+    return 0;
+}
+
+static void rp_crx_log_snapshot(const char *phase, uint32_t id,
+                                const struct rp_crx_bank_snapshot *s)
+{
+    RP_CRX_TRACE("RETRY %s id=%d latch=%d lease=%d mode=%x",
+                 phase, (int)id, (int)s->latch, (int)s->hw_active, s->mode);
+    RP_CRX_TRACE("RETRY %s backend=%x base=%x size=%x cur=%x",
+                 phase, s->backend, s->arena_base, s->arena_size, s->cursor);
+    RP_CRX_TRACE("RETRY %s ctx=%x p0=%x p1=%x", phase,
+                 s->context, s->pointers[0], s->pointers[1]);
+    RP_CRX_TRACE("RETRY %s p2=%x p3=%x p4=%x", phase,
+                 s->pointers[2], s->pointers[3], s->pointers[4]);
+}
+
+static int rp_crx_snapshot_arena_valid(const struct rp_crx_bank_snapshot *s);
+
+/* v19 32-bit range construction uses 64-bit intermediates to avoid wrap.
+ * Context fields are touched only after the v18 bank snapshot validates the
+ * mapped D-context region. They can still change concurrently (non-atomic). */
+static int rp_crx_v19_read_bank(uint32_t mgr, uint32_t id,
+                                const struct rp_crx_bank_snapshot *root,
+                                struct rp_crx_v19_range *out)
+{
+    memset(out, 0, sizeof(*out));
+    struct rp_crx_bank_snapshot b;
+    if (rp_crx_bank_snapshot(mgr, id, &b) || b.backend != root->backend ||
+        b.mode != RP_CRX_MODE_LOSSLESS || b.cursor != root->cursor ||
+        b.arena_base != root->arena_base || b.arena_size != root->arena_size)
+        return -1;
+    out->latch = b.latch;
+    out->hw = b.hw_active;
+    out->p0=b.pointers[0]; out->p1=b.pointers[1];
+    out->p2=b.pointers[2]; out->p3=b.pointers[3]; out->p4=b.pointers[4];
+    out->present = b.latch || b.hw_active || b.pointers[0] || b.pointers[1] ||
+                   b.pointers[2] || b.pointers[3] || b.pointers[4];
+    if (!out->present) { out->valid=1u; return 0; }
+    volatile uint8_t *c8=(volatile uint8_t *)(uintptr_t)b.context;
+    volatile uint32_t *c32=(volatile uint32_t *)(uintptr_t)b.context;
+    out->n = c8[0x272];
+    out->k = c32[0x278/4];
+    volatile uint32_t *bk=(volatile uint32_t *)(uintptr_t)b.backend;
+    out->opt=(bk[0x1c/4] == 1u) ? 1u : 0u;
+    /* LOW_D_ALLOC forces N=8 when backend+0x10 bit 13 is set. */
+    if ((bk[0x10/4] & 0x2000u) != 0u) out->n=8u;
+    uint64_t arena_end = (uint64_t)b.arena_base+b.arena_size;
+    if (out->k == 0u || out->k > 2048u || out->n == 0u ||
+        out->n > 255u || !out->p0 || !out->p1 || !out->p2 ||
+        !out->p3 || !out->p4 ||
+        out->p0 > out->p1 || out->p1 > out->p3 ||
+        out->p3 > out->p2 || out->p2 > out->p4)
+        return -2;
+    /* Last base pointer is END of K*12, followed by K*4 and optional
+     * two 0x400 blocks. Optional pre-alignment is 1..32 B, not 0..31. */
+    uint64_t end64=(uint64_t)out->p4+(uint64_t)out->k*4u;
+    if (out->opt)
+    {
+        end64+=(uint64_t)(32u-((uint32_t)end64 & 31u))+0x800u;
+        /* Optional pointers must point into the same workspace. */
+        if (!c32[0x258/4] || !c32[0x25c/4] ||
+            c32[0x258/4] >= c32[0x25c/4]) return -3;
+        if ((uint64_t)c32[0x25c/4]+0x400u > end64) return -4;
+    }
+    end64=(end64+31u)&~31ull;
+    if (end64 > 0xFFFFFFFFull || end64 > arena_end ||
+        out->p0 < b.arena_base || end64 > b.cursor || end64 <= out->p0)
+        return -5;
+    out->lo=out->p0;
+    out->hi=(uint32_t)end64;
+    out->valid=1u;
+    /* Detect an allocator/mode change during this non-atomic scan. */
+    if (*(volatile uint32_t *)(uintptr_t)RP_CRX_BACKEND_SLOT != b.backend ||
+        *(volatile uint32_t *)(uintptr_t)(b.backend+0x14u) != b.cursor ||
+        *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT != mgr)
+    { out->valid=0u; return -6; }
+    return 0;
+}
