@@ -4552,23 +4552,102 @@ static void worker(void)
                 send_log_data_str("Recording is active\n");
                 start_time = get_ms_clock();
                 #endif
-                recording_state = ACTIVE;
+                if (raw_vid_codec_is_crx(rp_record_codec) &&
+                    RP_START_PROBE_STAGE == 36)
+                {
+                    RP_START_TRACE("V23.2 START bpp=%d res=%d wh=%d,%d dynamic=1",
+                                   event->requested_bpp,event->resolution_mode,
+                                   (int)event->w,(int)event->h);
+                    raw_vid_rp_crx_observe_banks("before-record",0u);
+                }
+                    if (rp_w3_matrix_case_active()) rp_w3_matrix_on_arm();
+                    recording_state = ACTIVE;
+                    rp_w3_matrix_stage(110,0);
+                RP_START_TRACE("S14 ACTIVE");
             }
             break;
 
         case COMMAND_STOP:
+            rp_w3_matrix_stage(200,0);
             SEND_LOG_DATA_STR("Worker got stop request.\n");
             // FIXME how to stop is more complicated than this,
             // need to flush, reset some pointers, block new start
             // until finished.
             if (recording_state == ACTIVE)
             {
+                /* STOP must not spend up to the normal adaptive wait budget
+                 * before draining already queued VIDFs. */
+                rp_writer_drain_requested = 1u;
+                /* Queue ordering guarantees every IMAGE_DATA event from this
+                 * recording has already been consumed before COMMAND_STOP.
+                 * Arm v22 reclaim now; the actual write can only happen after
+                 * OUR final Canon FreeEncBuffer event-4 handler returns. */
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 36 &&
+                    raw_vid_codec_is_crx(rp_record_codec))
+                    raw_vid_rp_crx_request_reclaim();
+
+                int rp_stop_rc = 0;
+                int rp_stop_restore_rc = 0;
+                int rp_stop_drain_rc = 0;
+                if (is_camera("RP", "1.6.0"))
+                {
+                    /*
+                     * Stop publishing ML destinations, steer desc.offset back to
+                     * Canon at a proven W3 latch boundary, drain exact-end Complete
+                     * matches, then restore the Canon Complete callback.
+                     */
+                    rp_stop_rc = raw_vid_rp_stop_before_raw_off();
+                    if (rp_stop_rc)
+                    {
+                        SEND_LOG_DATA_STR("WARNING: RP capture backend stop was not clean\n");
+                    }
+
+                    if (RP_START_PROBE_STAGE == 33)
+                    {
+                        int m2m_stop_rc = raw_vid_rp_m2m_session_stop();
+                        RP_START_TRACE("S33 mem2mem session stop rc=%d", m2m_stop_rc);
+                        if (m2m_stop_rc)
+                        {
+                            SEND_LOG_DATA_STR("WARNING: RP mem2mem session stop was not clean\n");
+                        }
+                    }
+                }
+
+                /* Read the experimental HW state AFTER transfer stop, but
+                 * BEFORE any canonical PU/BPP restore. No writes here. */
+                if (rp_w3_matrix_case_active()) rp_w3_matrix_capture_end();
+
+                /* Restore Canon's native 14-bit PackUnpack while RAW LV is
+                 * still enabled, so Mem1Path can apply the restored mode/pitch
+                 * for a couple of Canon-owned frames before raw_lv_release(). */
+                if (is_camera("RP", "1.6.0"))
+                {
+                    rp_w3_matrix_stage(210,0);
+                    int matrix_restore_rc = rp_w3_matrix_case_active()
+                        ? raw_vid_rp_matrix_restore() : 0;
+                    int bpp_restore_rc = raw_vid_rp_restore_bit_depth();
+                    rp_stop_restore_rc = matrix_restore_rc ? matrix_restore_rc : bpp_restore_rc;
+                    rp_w3_matrix_restore_result(matrix_restore_rc ? matrix_restore_rc :
+                                                 bpp_restore_rc);
+                    rp_w3_matrix_stage(211, matrix_restore_rc ? matrix_restore_rc : bpp_restore_rc);
+                    RP_START_TRACE("BPP restore rc=%d raw=%d pitch=%d",
+                                   bpp_restore_rc, raw_info.bits_per_pixel,
+                                   raw_info.pitch);
+                    if (bpp_restore_rc)
+                    {
+                        SEND_LOG_DATA_STR("WARNING: RP RAW bit-depth restore was not clean\n");
+                    }
+                }
+
+                if (rp_w3_matrix_case_active())
+                    rp_w3_matrix_pre_cleanup(rp_stop_rc, 0,
+                                              (int)video_frame_count, 0, 0);
                 // restore LV away from raw
                 // This ML asserts if you haven't paired it with raw_lv_request(),
                 // but is safe.
+                rp_w3_matrix_stage(220,0);
                 raw_lv_release();
-                // TODO mlv_lite does restore_bit_depth(), we
-                // don't mess with this yet.
+                rp_w3_matrix_stage(221,0);
 
                 #ifdef RAW_VID_LOG
                 snprintf(log_buf, buf_size, "session time, data written: %d, %d\n",
@@ -4577,53 +4656,299 @@ static void worker(void)
                 session_data_size = 0;
                 #endif
 
-                // FIXME we want to handle any potential flushing before freeing stuff,
-                // we may need buffers for dealing with queued frames.
-                crop_buf = NULL;
-                if (crop_bufs[0]._buf != NULL)
+                // RP: all IMAGE_DATA events preceding COMMAND_STOP have now
+                // been consumed.  Drain any asynchronous full-buffer write and
+                // flush the final partial MLV data before rewriting the header.
+                if (is_camera("RP", "1.6.0"))
                 {
-                    fio_free(crop_bufs[0]._buf);
-                    crop_bufs[0]._buf = NULL;
-                    crop_bufs[0].start = NULL;
-                    crop_bufs[0].cur = NULL;
-                    crop_bufs[0].end = NULL;
-                }
-                if (crop_bufs[1]._buf != NULL)
-                {
-                    fio_free(crop_bufs[1]._buf);
-                    crop_bufs[1]._buf = NULL;
-                    crop_bufs[1].start = NULL;
-                    crop_bufs[1].cur = NULL;
-                    crop_bufs[1].end = NULL;
+                    int drain_rc = 0;
+                    if (RP_START_PROBE_STAGE == 36)
+                        drain_rc = rp_drain_frame_slots_on_stop();
+                    else
+                        drain_rc = rp_flush_crop_bufs_on_stop(crop_bufs);
+
+                    rp_stop_drain_rc = drain_rc;
+                    if (drain_rc)
+                    {
+                        RP_START_TRACE("S36 WR drain FAIL rc=%d", drain_rc);
+                        SEND_LOG_DATA_STR("WARNING: RP output-buffer drain failed\n");
+                        /* On timeout, the writer may still reference FILE* and
+                         * buffers.  Never close/free them on this path. */
+                        if (RP_START_PROBE_STAGE == 36 &&
+                            (rp_writer_jobs_done != rp_writer_jobs_queued ||
+                             rp_header_write_pending))
+                            rp_writer_storage_lockout = 1u;
+                    }
+                    if (RP_START_PROBE_STAGE == 36 &&
+                        (rp_writer_io_fail || rp_writer_post_fail ||
+                         rp_header_write_failed))
+                        rp_writer_storage_lockout = 1u;
+                    RP_START_TRACE("S36 WR stats queued=%d done=%d batches=%d max_batch=%d max_bytes=%dKB post_fail=%d io_fail=%d max_us=%d avg=%d.%02dMBs",
+                                   (int)rp_writer_jobs_queued,
+                                   (int)rp_writer_jobs_done,
+                                   (int)rp_writer_batches,
+                                   (int)rp_writer_max_batch_frames,
+                                   (int)(rp_writer_max_batch_bytes / 1024u),
+                                   (int)rp_writer_post_fail,
+                                   (int)rp_writer_io_fail,
+                                   (int)rp_writer_max_us,
+                                   (int)(rp_writer_rate_x100 / 100u),
+                                   (int)(rp_writer_rate_x100 % 100u));
+                    RP_START_TRACE("S36 ADAPT summary pref=%dMB max_allowed=%dMB trials=%d ok=%d peak=%dMB ingress=%d.%02d drain=%d.%02d",
+                                   (int)(rp_adapt_sizes_bytes[rp_adapt.preferred_index] / (1024u * 1024u)),
+                                   (int)(rp_adapt_sizes_bytes[rp_adapt.allowed_index] / (1024u * 1024u)),
+                                   (int)rp_adapt.probe_attempts, (int)rp_adapt.writes_ok,
+                                   (int)(rp_adapt.peak_success_bytes / (1024u * 1024u)),
+                                   (int)(rp_writer_ingress_rate_x100 / 100u),
+                                   (int)(rp_writer_ingress_rate_x100 % 100u),
+                                   (int)(rp_writer_drain_rate_x100 / 100u),
+                                   (int)(rp_writer_drain_rate_x100 % 100u));
+                    for (uint32_t ai = 0; ai < RP_ADAPT_BUCKET_COUNT; ++ai)
+                    {
+                        RP_START_TRACE("S36 ADAPT bin=%dMB n=%d fio=%d.%02d effective=%d.%02d",
+                                       (int)(rp_adapt_sizes_bytes[ai] / (1024u * 1024u)),
+                                       (int)rp_adapt.buckets[ai].samples,
+                                       (int)(rp_adapt.buckets[ai].write_rate_x100 / 100u),
+                                       (int)(rp_adapt.buckets[ai].write_rate_x100 % 100u),
+                                       (int)(rp_adapt.buckets[ai].effective_rate_x100 / 100u),
+                                       (int)(rp_adapt.buckets[ai].effective_rate_x100 % 100u));
+                    }
+                    RP_START_TRACE("S36 COALESCE waits=%d hits=%d timeout=%d max_us=%d total_us=%d",
+                                   (int)rp_writer_coalesce_waits,
+                                   (int)rp_writer_coalesce_hits,
+                                   (int)rp_writer_coalesce_timeouts,
+                                   (int)rp_writer_coalesce_max_us,
+                                   (int)rp_writer_coalesce_total_us);
+                    if (RP_START_PROBE_STAGE == 36)
+                    {
+                        RP_START_TRACE("S36 DYNSLOT stats count=%d free=%d reserved=%d min_free=%d starves=%d shrink=%d defer=%d rebuild=%d reserve_peak=%d",
+                                       (int)rp_frame_slot_count,
+                                       (int)rp_count_free_frame_slots(),
+                                       (int)rp_count_reserved_frame_slots(),
+                                       (int)rp_slot_min_free,
+                                       (int)rp_slot_starves,
+                                       (int)rp_slot_shrink_ok,
+                                       (int)rp_slot_shrink_deferred,
+                                       (int)rp_slot_free_rebuilds,
+                                       (int)rp_slot_reserved_peak);
+                        RP_START_TRACE("S36 REV2 HEADER state pending=%d done=%d fail=%d bytes=%d",
+                                       (int)rp_header_write_pending,
+                                       (int)rp_header_write_done,
+                                       (int)rp_header_write_failed,
+                                       (int)rp_header_write_size);
+                        RP_START_TRACE("S36 MEM stats source=%dKB suite=%dKB suite_chunks=%d runs=%d output=%dKB waste=%dKB srm=%d",
+                                       (int)(raw_vid_rp_capture_buffer_bytes() / 1024u),
+                                       (int)(rp_frame_suite_bytes / 1024u),
+                                       (int)rp_frame_suite_chunks,
+                                       (int)rp_frame_chunk_count,
+                                       (int)(rp_frame_output_bytes / 1024u),
+                                       (int)(rp_frame_waste_bytes / 1024u),
+                                       RP_V3D_USE_SRM);
+                        if (raw_vid_codec_is_crx(rp_record_codec))
+                        {
+                            struct rp_crx_stats crx_stats;
+                            raw_vid_rp_crx_get_stats(&crx_stats);
+                            RP_START_TRACE("CRX stats ok=%d fail=%d submitted=%d complete=%d submit_err=%d timeout=%d unexpected=%d poisoned=%d latched_bpp=%d free=%d/%d cb_err=%d",
+                                           (int)rp_crx_frames_ok, (int)rp_crx_frames_failed,
+                                           (int)crx_stats.submitted, (int)crx_stats.completed,
+                                           (int)crx_stats.submit_errors, (int)crx_stats.timeouts,
+                                           (int)crx_stats.unexpected_callbacks, (int)crx_stats.poisoned,
+                                           (int)crx_stats.encoder_latched_bits,
+                                           (int)crx_stats.free_completed, (int)crx_stats.free_pending,
+                                           (int)crx_stats.free_callback_errors);
+                            RP_START_TRACE("V22 reclaim attempts=%d ok=%d rc=%d path=%d route=%d/%d",
+                                           (int)crx_stats.reclaim_attempts,
+                                           (int)crx_stats.reclaim_successes,
+                                           (int)crx_stats.reclaim_last_rc,
+                                           (int)crx_stats.reclaim_last_path,
+                                           (int)crx_stats.reclaim_route_type,
+                                           (int)crx_stats.reclaim_route_id);
+                            RP_START_TRACE("CRX input-path direct_w3=%d staged_m2m=%d dynamic=1",
+                                           (int)rp_crx_direct_w3_frames,
+                                           (int)rp_crx_staged_input_frames);
+                            RP_START_TRACE("CRX perf input_us=%d encode_us=%d detach_us=%d compact_us=%d sample=%d blocks=%d release_fail=%d max_enc=%d",
+                                           (int)rp_crx_total_input_us,
+                                           (int)rp_crx_total_encode_us,
+                                           (int)rp_crx_total_detach_us,
+                                           (int)rp_crx_total_compact_us,
+                                           (int)rp_crx_total_payload_bytes,
+                                           (int)rp_crx_total_m2m_blocks,
+                                           (int)rp_crx_release_failures,
+                                           (int)crx_stats.max_encode_us);
+                        }
+                    }
                 }
 
-                if (raw_vid_fp != NULL)
+                crop_buf = NULL;
+
+                if (raw_vid_fp != NULL && !(
+                    rp_writer_storage_lockout &&
+                    (rp_writer_jobs_done != rp_writer_jobs_queued ||
+                     rp_header_write_pending)))
                 {
                     // TODO flush pending data
 
-                    // update with the final video frame count
-                    err = update_video_frame_count(video_frame_count, header_buf, header_buf + header_size);
-                    if (err)
+                    if (header_size != 0u &&
+                        !(rp_stop_drain_rc || rp_writer_io_fail ||
+                          rp_header_write_failed))
                     {
-                        SEND_LOG_DATA_STR("ERROR: couldn't update video frame count\n");
-                        break;
-                    }
+                        // update with the final video frame count
+                        err = update_video_frame_count(
+                            video_frame_count,
+                            header_buf, header_buf + header_size);
+                        if (err)
+                        {
+                            SEND_LOG_DATA_STR("ERROR: couldn't update video frame count\n");
+                            break;
+                        }
 
-                    // write back; file is now complete
-                    FIO_SeekSkipFile(raw_vid_fp, 0, SEEK_SET);
-                    FIO_WriteFile(raw_vid_fp, header_buf, header_size);
+                        // write back; file is now complete
+                        FIO_SeekSkipFile(raw_vid_fp, 0, SEEK_SET);
+                        FIO_WriteFile(raw_vid_fp, header_buf, header_size);
+                    }
+                    else if (header_size != 0u &&
+                             (rp_stop_drain_rc || rp_writer_io_fail ||
+                              rp_header_write_failed))
+                    {
+                        RP_START_TRACE("S36 ADAPT incomplete output: skip final MLVI rewrite");
+                    }
+                    else if (raw_vid_codec_is_crx(rp_record_codec))
+                    {
+                        /* No successful CRX frame means no Canon CMP1 existed,
+                         * so a valid revision-2 CRXI could not be written. Keep
+                         * the file empty rather than invent codec metadata. */
+                        RP_START_TRACE("CRX REV2 no-frame stop: no CMP1/header written");
+                    }
 
                     FIO_CloseFile(raw_vid_fp);
                     raw_vid_fp = NULL;
+                }
+                else if (rp_writer_storage_lockout &&
+                         (rp_writer_jobs_done != rp_writer_jobs_queued ||
+                          rp_header_write_pending))
+                {
+                    RP_START_TRACE("S36 WR pending: preserving open file and suite");
+                    SEND_LOG_DATA_STR("ERROR: writer still active; file/memory retained until reboot\n");
                 }
                 else
                 {
                     SEND_LOG_DATA_STR("ERROR: unexpected fp state in worker\n");
                 }
 
+                if (is_camera("RP", "1.6.0") &&
+                    RP_START_PROBE_STAGE == 36 &&
+                    RP_CRX_ROUNDTRIP_VERIFY &&
+                    rp_record_codec == RAW_VID_CODEC_CRX)
+                {
+                    int ref_write_rc = rp_write_crx_reference_sidecar();
+                    if (ref_write_rc)
+                    {
+                        RP_START_TRACE("CRX REF sidecar FAIL rc=%d", ref_write_rc);
+                        SEND_LOG_DATA_STR("WARNING: CRX round-trip reference sidecar write failed\n");
+                    }
+                }
+
+                /* v110: retain output arenas until CRX session-end confirms
+                 * that the encoder can no longer access destination slots.
+                 * The legacy ordering freed the shoot suite beforehand. */
+                free_crop_bufs(crop_bufs);
                 stop_mlv_session();
+
+                int cleanup_rc = 0;
+                if (is_camera("RP", "1.6.0"))
+                {
+                    /* Task context, RAW already off.  CRX FreeEncBuffer is an
+                     * asynchronous Canon event, so close that lifecycle first
+                     * and only then return the RP capture backend to idle. */
+                    int crx_end_rc = 0;
+                    if (RP_START_PROBE_STAGE == 36 &&
+                        raw_vid_codec_is_crx(rp_record_codec))
+                    {
+                        crx_end_rc = raw_vid_rp_crx_end_session();
+                        RP_START_TRACE("CRX session end rc=%d", crx_end_rc);
+                    }
+
+                    raw_vid_rp_write_report(rp_stop_rc);
+                    if (rp_w3_matrix_case_active())
+                        rp_w3_matrix_storage_status((int)rp_writer_io_fail,
+                                                    (int)rp_writer_post_fail);
+                    int backend_cleanup_rc = raw_vid_rp_cleanup_after_raw_off();
+                    /* Only after FIO has closed, writer drained, CRX has ended
+                     * and backend handback completed may owners be released. */
+                    if (RP_START_PROBE_STAGE == 36)
+                    {
+                        if (crx_end_rc || backend_cleanup_rc || rp_stop_drain_rc ||
+                            rp_writer_io_fail || rp_writer_post_fail ||
+                            raw_vid_fp != NULL || rp_writer_storage_lockout ||
+                            rp_writer_jobs_done != rp_writer_jobs_queued ||
+                            rp_header_write_pending)
+                        {
+                            rp_v110_owner_quarantine=1;
+                            rp_writer_storage_lockout=1;
+                            RP_START_TRACE("SS110 RETAIN crx=%d backend=%d drain=%d writer=%d/%d fp=%x",
+                                           crx_end_rc,backend_cleanup_rc,rp_stop_drain_rc,
+                                           (int)rp_writer_jobs_done,(int)rp_writer_jobs_queued,
+                                           (uint32_t)raw_vid_fp);
+                        }
+                        else rp_free_frame_slots();
+                    }
+                    cleanup_rc = crx_end_rc ? crx_end_rc : backend_cleanup_rc;
+                    if (!cleanup_rc && rp_stop_restore_rc) cleanup_rc = rp_stop_restore_rc;
+                    if (!cleanup_rc && rp_stop_rc) cleanup_rc = rp_stop_rc;
+                    if (!cleanup_rc && rp_stop_drain_rc) cleanup_rc = rp_stop_drain_rc;
+                    RP_START_TRACE("POST CLEANUP rc=%x backend=%x crx=%x",
+                                   cleanup_rc, backend_cleanup_rc, crx_end_rc);
+                }
+
+                /*
+                 * Do not expose a new start until Canon has seen a short
+                 * ordinary-LV quiescence window after RAW teardown.
+                 */
+                if (is_camera("RP", "1.6.0") && lv)
+                    msleep(100);
+
+                /* v23.2 dynamic-only worker: the only latch/cursor mutation
+                 * path is rp_crx.c guarded D-slot reclaim. Historical
+                 * latch/retry/tail experiments are not executed by REC. */
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 36 &&
+                    raw_vid_codec_is_crx(rp_record_codec))
+                    raw_vid_rp_crx_observe_banks("post-cleanup",0u);
+
+                if (rp_w3_matrix_case_active())
+                    rp_w3_matrix_on_stop(cleanup_rc, rp_stop_rc,
+                                          rp_stop_drain_rc);
+
+                int was_crx = raw_vid_codec_is_crx(rp_record_codec);
+                int crx_backend_unsafe = 0;
+                if (is_camera("RP", "1.6.0") && was_crx)
+                {
+                    struct rp_crx_stats stop_stats;
+                    raw_vid_rp_crx_get_stats(&stop_stats);
+                    crx_backend_unsafe = stop_stats.poisoned ||
+                        stop_stats.free_pending != 0u ||
+                        stop_stats.free_callback_errors != 0u;
+                }
+
+                rp_record_codec = RAW_VID_CODEC_RAW;
+                rp_record_wire_bpp = 14;
                 recording_state = INACTIVE;
-                SEND_LOG_DATA_STR("Recording is inactive\n");
+                rp_still_session_active = 0u;
+                raw_vid_still_session_finish();
+                rp_w3_matrix_stage(250,cleanup_rc);
+
+                if (cleanup_rc == 0 && !crx_backend_unsafe &&
+                    !rp_writer_storage_lockout)
+                {
+                    allow_recording();
+                    SEND_LOG_DATA_STR("Recording is inactive\n");
+                }
+                else
+                {
+                    RP_START_TRACE("RP backend lockout cleanup=%d crx_unsafe=%d writer_unsafe=%d",
+                                   cleanup_rc, crx_backend_unsafe,
+                                   (int)rp_writer_storage_lockout);
+                    SEND_LOG_DATA_STR("RP storage/backend unsafe; cold boot before next ML recording\n");
+                }
             }
             break;
 
