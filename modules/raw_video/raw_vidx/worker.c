@@ -2543,6 +2543,728 @@ static int rp_crx_validate_and_latch_cmp1(const void *cmp1_ptr,
 
     return 0;
 }
+
+static int rp_process_crx_frame_slot(struct raw_vid_event *event,
+                                     uint32_t *video_frame_count,
+                                     char *header_buf,
+                                     uint32_t header_buf_size,
+                                     uint32_t *mlv_header_size)
+{
+    struct rp_frame_slot *input_slot = rp_get_free_frame_slot();
+    struct rp_frame_slot *out_slot = input_slot;
+    if (input_slot == NULL)
+    {
+        rp_slot_starves++;
+        RP_START_TRACE("CRX SLOT STARVE count=%d", (int)rp_frame_slot_count);
+        raw_vid_rp_request_stop();
+        raw_vid_request_stop_async();
+        return -1000;
+    }
+
+    const uint32_t frame_no = *video_frame_count;
+    const uint32_t bits = (uint32_t)raw_vid_get_bpp();
+    const int lossy = raw_vid_codec_is_lossy_crx(rp_record_codec);
+    const uint32_t input_bits = (uint32_t)event->w * (uint32_t)event->h * bits;
+    const uint32_t input_bytes = input_bits / 8u;
+    const uint32_t input_slot_capacity =
+        (uint32_t)(input_slot->end - input_slot->start);
+    int rc = 0;
+    int sem_rc = 0;
+    int release_bad = 0;
+    uint32_t first_release_rc = 0;
+    struct rp_crx_result result;
+    memset(&result, 0, sizeof(result));
+
+    if ((bits != 10u && bits != 12u && bits != 14u) ||
+        (input_bits & 7u) != 0u ||
+        input_bytes == 0u || input_bytes > input_slot_capacity)
+    {
+        rc = -1001;
+        goto fail_no_handle;
+    }
+
+    uint32_t input_us = 0;
+    uint32_t ref_copy_us = 0;
+    int use_direct_w3 = rp_crx_standard_direct_w3_allowed();
+    if (!use_direct_w3)
+    {
+        RP_START_TRACE("V23.2 DIRECT required");
+        rc = -1032;
+        goto fail_no_handle;
+    }
+    if (lossy && !use_direct_w3)
+    {
+        RP_START_TRACE("CRAW reject: standard direct-W3 path not available");
+        rc = -1030;
+        goto fail_no_handle;
+    }
+
+    /*
+     * Phase A / input acquisition.
+     *
+     * STANDARD capture:
+     *   hold the completed W3 capture slot and submit physical W3 + ROI
+     *   directly to E0651986 / Canon AlgsMgr.
+     *
+     * EXPERIMENT capture (latch/retry/session or cursor/tail audit):
+     *   preserve v20.1 exactly: W3 -> tight R46/W13 slot, release W3,
+     *   then submit the tight source.
+     */
+    if (use_direct_w3)
+    {
+        uint32_t source_width = (uint32_t)raw_info.width;
+        uint32_t source_pitch = (uint32_t)raw_info.pitch;
+        uint32_t source_height = (uint32_t)raw_info.height;
+        uint64_t expected_pitch = (uint64_t)source_width * bits / 8u;
+
+        if (event->capture_slot < 0 ||
+            !event->src ||
+            (((uintptr_t)event->src) & 0x3Fu) != 0u ||
+            source_width == 0u || source_height == 0u ||
+            expected_pitch != source_pitch ||
+            event->x + event->w > source_width ||
+            event->y + event->h > source_height ||
+            (((uint32_t)event->x * bits) & 7u) != 0u)
+        {
+            RP_START_TRACE("CRX DIRECT W3 reject f=%d src=%x slot=%d phys=%d,%d pitch=%d roi=%d,%d %dx%d bpp=%d",
+                           (int)frame_no, (uint32_t)event->src,
+                           (int)event->capture_slot,
+                           (int)source_width, (int)source_height,
+                           (int)source_pitch,
+                           (int)event->x, (int)event->y,
+                           (int)event->w, (int)event->h, (int)bits);
+            rc = -1020;
+            goto fail_no_handle;
+        }
+
+        RP_START_TRACE("CRX DIRECT W3 submit f=%d lossy=%d src=%x slot=%d phys=%d,%d pitch=%d roi=%d,%d %dx%d bpp=%d",
+                       (int)frame_no, lossy ? 1 : 0, (uint32_t)event->src,
+                       (int)event->capture_slot,
+                       (int)source_width, (int)source_height,
+                       (int)source_pitch,
+                       (int)event->x, (int)event->y,
+                       (int)event->w, (int)event->h, (int)bits);
+
+        rc = raw_vid_rp_crx_encode_source_mode(
+            event->src, source_width,
+            event->x, event->y, event->w, event->h,
+            bits, lossy, &result);
+        rp_crx_direct_w3_frames++;
+    }
+    else
+    {
+        if (lossy)
+        {
+            rc = -1031;
+            goto fail_no_handle;
+        }
+        sem_rc = take_semaphore_now(edmac_sem);
+        if (sem_rc)
+        {
+            rc = -1002;
+            goto fail_no_handle;
+        }
+
+        rc = raw_vid_rp_m2m_crop_once(
+            event->src, raw_info.pitch,
+            event->x, event->y, event->w, event->h,
+            input_slot->start, input_bytes, &input_us);
+        give_semaphore(edmac_sem);
+
+        if (rc)
+        {
+            RP_START_TRACE("CRX input crop FAIL frame=%d rc=%d us=%d",
+                           (int)frame_no, rc, (int)input_us);
+            rc = -1003;
+            goto fail_no_handle;
+        }
+        rp_crx_total_input_us += input_us;
+        rp_crx_staged_input_frames++;
+
+        RP_START_TRACE("CRX STAGED INPUT f=%d us=%d",
+                       (int)frame_no, (int)input_us);
+
+        if (event->capture_slot >= 0)
+        {
+            raw_vid_rp_release_buffer(event->capture_slot);
+            event->capture_slot = -1;
+        }
+
+        rc = raw_vid_rp_crx_encode(
+            input_slot->start, event->w, event->h, bits, &result);
+    }
+
+    rp_crx_total_encode_us += result.encode_us;
+    if (rc)
+    {
+        RP_START_TRACE("CRX encode FAIL frame=%d rc=%d submit=%x count=%d us=%d",
+                       (int)frame_no, rc, result.submit_rc,
+                       (int)result.count, (int)result.encode_us);
+        rp_crx_release_handles(&result, &first_release_rc);
+        rc = -1004;
+        goto fail_no_handle;
+    }
+
+    if (result.count != 1u || result.handles[0] == 0u)
+    {
+        RP_START_TRACE("CRX result count FAIL frame=%d count=%d h0=%x h1=%x h2=%x",
+                       (int)frame_no, (int)result.count,
+                       result.handles[0], result.handles[1], result.handles[2]);
+        rp_crx_release_handles(&result, &first_release_rc);
+        rc = -1005;
+        goto fail_no_handle;
+    }
+
+    /*
+     * Direct-W3 lifetime boundary: raw_vid_rp_crx_encode_source() returned
+     * only after the completion callback. In the round-trip build, generate
+     * the independent tight reference NOW, while the same W3 slot is still
+     * held. This copy cannot affect encoder input.
+     */
+    if (use_direct_w3)
+    {
+        if (RP_CRX_ROUNDTRIP_VERIFY && frame_no == 0u)
+        {
+            sem_rc = take_semaphore_now(edmac_sem);
+            if (sem_rc)
+            {
+                rp_crx_release_handles(&result, &first_release_rc);
+                rc = -1021;
+                goto fail_no_handle;
+            }
+
+            int ref_rc = raw_vid_rp_m2m_crop_once(
+                event->src, raw_info.pitch,
+                event->x, event->y, event->w, event->h,
+                input_slot->start, input_bytes, &ref_copy_us);
+            give_semaphore(edmac_sem);
+
+            if (ref_rc)
+            {
+                RP_START_TRACE("CRX DIRECT W3 ref crop FAIL f=%d rc=%d us=%d",
+                               (int)frame_no, ref_rc, (int)ref_copy_us);
+                rp_crx_release_handles(&result, &first_release_rc);
+                rc = -1022;
+                goto fail_no_handle;
+            }
+
+            RP_START_TRACE("CRX DIRECT W3 ref crop PASS f=%d us=%d bytes=%d",
+                           (int)frame_no, (int)ref_copy_us, (int)input_bytes);
+        }
+
+        if (event->capture_slot >= 0)
+        {
+            RP_START_TRACE("CRX DIRECT W3 release slot=%d after callback enc_us=%d",
+                           (int)event->capture_slot, (int)result.encode_us);
+            raw_vid_rp_release_buffer(event->capture_slot);
+            event->capture_slot = -1;
+        }
+    }
+
+    uint32_t handle = result.handles[0];
+    volatile uint32_t *hw = (volatile uint32_t *)(uintptr_t)handle;
+    uint32_t profile = hw[1];
+    uint32_t expected_profile = result.descriptor_type;
+    uint32_t route_id = result.encoder_id;
+    uint32_t main_ptr = hw[2];
+    uint32_t main_size = hw[3];
+    uint32_t ring_slots = hw[6];
+    uint32_t ring_addr_ptr = hw[7];
+    uint32_t ring_size_ptr = hw[8];
+
+    /* Canon copies the submitted descriptor.type into result_handle[1].
+     * The old validator incorrectly derived this value from BPP, which is
+     * only true for the historical fixed routes (14->0, 12->4, 10->5).
+     * Dynamic D-slot mode deliberately decouples BPP from route type. */
+    int route_type_ok = lossy
+        ? (expected_profile == 2u || expected_profile == 3u ||
+           expected_profile == 6u || expected_profile == 7u)
+        : (expected_profile == 0u || expected_profile == 1u ||
+           expected_profile == 4u || expected_profile == 5u);
+
+    if (!route_type_ok || route_id >= 22u ||
+        profile != expected_profile ||
+        !main_ptr || main_size == 0u || main_size > RP_CRX_META_MAX_BYTES ||
+        ring_slots == 0u || ring_slots > RP_CRX_RING_MAX ||
+        !ring_addr_ptr || !ring_size_ptr)
+    {
+        RP_START_TRACE("CRX handle FAIL f=%d h=%x prof=%d exp=%d id=%d main=%x/%d",
+                       (int)frame_no, handle, (int)profile, (int)expected_profile,
+                       (int)route_id, main_ptr, (int)main_size);
+        RP_START_TRACE("CRX handle ring slots=%d a=%x s=%x",
+                       (int)ring_slots, ring_addr_ptr, ring_size_ptr);
+        rp_crx_release_handles(&result, &first_release_rc);
+        rc = -1006;
+        goto fail_no_handle;
+    }
+
+    volatile uint32_t *ring_addr =
+        (volatile uint32_t *)(uintptr_t)ring_addr_ptr;
+    volatile uint32_t *ring_size =
+        (volatile uint32_t *)(uintptr_t)ring_size_ptr;
+
+    uint32_t sub_ptr = ring_addr[0];
+    uint32_t sub_size = ring_size[0];
+    if (!sub_ptr || sub_size == 0u || sub_size > RP_CRX_META_MAX_BYTES)
+    {
+        rp_crx_release_handles(&result, &first_release_rc);
+        rc = -1007;
+        goto fail_no_handle;
+    }
+
+    uint32_t segment_count = 0;
+    uint32_t payload_bytes = 0;
+
+    /* v12 runtime shows type/profile 0, 4 and 5 use the same Canon
+     * CreateHandle family.  Keep the original strict topology checks: ring[0]
+     * is the CPU-readable CRX subheader and payload must occupy odd indices.
+     * Any profile-specific deviation still fails closed below. */
+    for (uint32_t i = 2u; i < ring_slots; i += 2u)
+    {
+        if (ring_addr[i] || ring_size[i])
+        {
+            RP_START_TRACE("CRX even-ring populated f=%d i=%d a=%x z=%d",
+                           (int)frame_no, (int)i, ring_addr[i],
+                           (int)ring_size[i]);
+            rp_crx_release_handles(&result, &first_release_rc);
+            rc = -1008;
+            goto fail_no_handle;
+        }
+    }
+
+    for (uint32_t i = 1u; i < ring_slots; i += 2u)
+    {
+        uint32_t a = ring_addr[i];
+        uint32_t z = ring_size[i];
+        if (!a && !z)
+            continue;
+        if (!a || !z || (z & 1u) || segment_count >= RP_CRX_MAX_SEGMENTS ||
+            payload_bytes > 0xFFFFFFFFu - z)
+        {
+            RP_START_TRACE("CRX ring FAIL f=%d i=%d a=%x z=%d seg=%d",
+                           (int)frame_no, (int)i, a, (int)z,
+                           (int)segment_count);
+            rp_crx_release_handles(&result, &first_release_rc);
+            rc = -1008;
+            goto fail_no_handle;
+        }
+        rp_crx_src_addr[segment_count] = a;
+        rp_crx_src_size[segment_count] = z;
+        payload_bytes += z;
+        segment_count++;
+    }
+
+    if (segment_count == 0u)
+    {
+        rp_crx_release_handles(&result, &first_release_rc);
+        rc = -1009;
+        goto fail_no_handle;
+    }
+
+    if (lossy)
+    {
+        /* Native full C-RAW on RP was observed with a much larger mdat
+         * subheader (~0x438) and 40 real payload segments.  Do not hard-code
+         * those values for the synthetic 1920x1080 test; log the topology and
+         * let CMP1 + host decode decide validity. */
+        RP_START_TRACE("CRAW topology f=%d profile=%d hdr=%d ring=%d seg=%d payload=%d",
+                       (int)frame_no, (int)profile, (int)sub_size,
+                       (int)ring_slots, (int)segment_count,
+                       (int)payload_bytes);
+    }
+
+    /*
+     * MLV CRX container revision 2 stream configuration.
+     *
+     * main_ptr/main_size is the exact Canon CMP1 returned by this encode.
+     * Latch it from frame 0, validate it against the actual recorder pipeline,
+     * then require byte-identical CMP1 for the rest of the logical clip.
+     */
+    int cmp1_state = rp_crx_validate_and_latch_cmp1(
+        (const void *)(uintptr_t)main_ptr, main_size,
+        (uint32_t)event->w, (uint32_t)event->h, bits, sub_size, lossy);
+    if (cmp1_state < 0)
+    {
+        rp_crx_release_handles(&result, &first_release_rc);
+        rc = -1016;
+        goto fail_no_handle;
+    }
+
+    if (header_buf == NULL || mlv_header_size == NULL || header_buf_size == 0u)
+    {
+        rp_crx_release_handles(&result, &first_release_rc);
+        rc = -1017;
+        goto fail_no_handle;
+    }
+
+    int first_stream_frame = (*mlv_header_size == 0u);
+    int header_needs_queue = 0;
+    if (first_stream_frame)
+    {
+        if (cmp1_state != 1)
+        {
+            rp_crx_release_handles(&result, &first_release_rc);
+            rc = -1018;
+            goto fail_no_handle;
+        }
+
+        uint32_t h = (uint32_t)write_file_headers_crx_v2(
+            header_buf, header_buf + header_buf_size,
+            rp_crx_cmp1_cache, rp_crx_cmp1_size, rp_crx_value_shift);
+        if (h == 0u || h > header_buf_size)
+        {
+            RP_START_TRACE("CRX REV2 header FAIL cmp1=%d shift=%d",
+                           (int)rp_crx_cmp1_size, (int)rp_crx_value_shift);
+            rp_crx_release_handles(&result, &first_release_rc);
+            rc = -1019;
+            goto fail_no_handle;
+        }
+        *mlv_header_size = h;
+        header_needs_queue = 1;
+        RP_START_TRACE("CRX REV2 header READY bytes=%d crxi=40+%d shift=%d",
+                       (int)h, (int)rp_crx_cmp1_size,
+                       (int)rp_crx_value_shift);
+    }
+
+    /*
+     * Phase C — revision-2 on-disk frame.
+     *
+     * The stream header is a one-time writer job. Every shoot-memory slot now
+     * contains only a normal sector-sized VIDF. This is crucial for dynamic
+     * shrink/coalescing: consecutive compressed slots can become physically
+     * adjacent regardless of the fixed stream-header byte count.
+     */
+    if (RP_CRX_ROUNDTRIP_VERIFY && frame_no == 0u)
+    {
+        out_slot = rp_get_free_frame_slot();
+        if (out_slot == NULL)
+        {
+            RP_START_TRACE("CRX out-slot STARVE f=%d slots=%d free=%d",
+                           (int)frame_no, (int)rp_frame_slot_count,
+                           (int)rp_count_free_frame_slots());
+            rp_crx_release_handles(&result, &first_release_rc);
+            rc = -1010;
+            goto fail_no_handle;
+        }
+    }
+
+    uint32_t slot_capacity =
+        (uint32_t)(out_slot->end - out_slot->start);
+
+    if (sub_size > 0xFFFFFFFFu - payload_bytes)
+    {
+        rp_crx_release_handles(&result, &first_release_rc);
+        rc = -1024;
+        goto fail_no_handle;
+    }
+    uint32_t sample_size = sub_size + payload_bytes;
+
+    char *vidf_start = out_slot->start;
+    uint32_t vidf_block_size = 0u;
+    char *sample_dst = write_video_frame_header_crx_v2(
+        sample_size, vidf_start, out_slot->end, &vidf_block_size);
+    if (sample_dst == NULL || vidf_block_size == 0u)
+    {
+        RP_START_TRACE("CRX REV2 VIDF header FAIL f=%d sample=%d cap=%d",
+                       (int)frame_no, (int)sample_size, (int)slot_capacity);
+        rp_crx_release_handles(&result, &first_release_rc);
+        rc = -1025;
+        goto fail_no_handle;
+    }
+
+    uint32_t slot_used = vidf_block_size;
+
+    /* CRX sample begins with Canon's mdat sample header (ring[0]). */
+    memcpy(sample_dst, (const void *)(uintptr_t)sub_ptr, sub_size);
+
+    /*
+     * v21.4 exact-pack: keep the REV2 sample byte-contiguous while using the
+     * SG capability as a true scatter/gather transaction.
+     *
+     * R46/W13 requires each destination base to be 64-byte aligned.  For each
+     * Canon segment we therefore plan at most: 
+     *
+     *   head 0..62 B -> its own 64-B aligned scratch cell
+     *   aligned remainder -> final sample destination
+     *
+     * All heads are transferred in ONE raw_vid_rp_m2m_copy_sg() call, copied
+     * to their final addresses with tiny CPU memcpy, then all aligned bulk
+     * pieces are transferred in ONE second SG call.  Large data never moves
+     * through the CPU and the expensive native resource lifecycle is paid at
+     * most twice per frame instead of up to twice per segment (40 for C-RAW).
+     */
+    uint8_t *sample_end = (uint8_t *)sample_dst + sample_size;
+    uint8_t *payload_dst = (uint8_t *)sample_dst + sub_size;
+    uintptr_t scratch_base =
+        ((uintptr_t)sample_end + 63u) & ~(uintptr_t)63u;
+    uint32_t head_count = 0u;
+    uint32_t bulk_count = 0u;
+    uint32_t planned_bytes = 0u;
+    int detach_rc = 0;
+
+    for (uint32_t i = 0; i < segment_count; i++)
+    {
+        uint32_t src = rp_crx_src_addr[i];
+        uint32_t remaining = rp_crx_src_size[i];
+        uint8_t *dst = payload_dst;
+
+        if (((uintptr_t)dst & 1u) != 0u || (remaining & 1u) != 0u)
+        {
+            detach_rc = -320;
+            break;
+        }
+
+        uint32_t mis = (uint32_t)((uintptr_t)dst & 63u);
+        if (mis)
+        {
+            uint32_t head = MIN(64u - mis, remaining);
+            if ((head & 1u) || head_count >= RP_CRX_MAX_SEGMENTS)
+            {
+                detach_rc = -321;
+                break;
+            }
+
+            rp_crx_head_src[head_count] = src;
+            rp_crx_head_size[head_count] = head;
+            rp_crx_head_final[head_count] = dst;
+            head_count++;
+            src += head;
+            dst += head;
+            remaining -= head;
+            planned_bytes += head;
+        }
+
+        if (remaining)
+        {
+            if (((uintptr_t)dst & 63u) != 0u ||
+                bulk_count >= RP_CRX_MAX_SEGMENTS)
+            {
+                detach_rc = -322;
+                break;
+            }
+            rp_crx_bulk_src[bulk_count] = src;
+            rp_crx_bulk_size[bulk_count] = remaining;
+            rp_crx_bulk_dst[bulk_count] = dst;
+            bulk_count++;
+            planned_bytes += remaining;
+        }
+
+        payload_dst += rp_crx_src_size[i];
+    }
+
+    uint32_t scratch_need = head_count * 64u;
+    if (!detach_rc &&
+        (planned_bytes != payload_bytes || payload_dst != sample_end))
+        detach_rc = -323;
+    if (!detach_rc && head_count &&
+        (scratch_base < (uintptr_t)sample_end ||
+         scratch_base + scratch_need > (uintptr_t)out_slot->end))
+    {
+        RP_START_TRACE("CRX REV2 SG scratch FAIL f=%d heads=%d need=%d sampleEnd=%d cap=%d",
+                       (int)frame_no, (int)head_count, (int)scratch_need,
+                       (int)((uintptr_t)sample_end - (uintptr_t)out_slot->start),
+                       (int)slot_capacity);
+        detach_rc = -324;
+    }
+
+    for (uint32_t i = 0; !detach_rc && i < head_count; i++)
+        rp_crx_head_scratch[i] = (void *)(scratch_base + i * 64u);
+
+    int sem_taken = 0;
+    sem_rc = detach_rc ? 0 : take_semaphore_now(edmac_sem);
+    if (!detach_rc && sem_rc)
+    {
+        rp_crx_release_handles(&result, &first_release_rc);
+        rc = -1012;
+        goto fail_no_handle;
+    }
+    if (!detach_rc)
+        sem_taken = 1;
+
+    uint32_t detach_bytes = 0;
+    uint32_t detach_blocks = 0;
+    uint32_t detach_us = 0;
+    uint32_t compact_us = 0;
+
+    if (!detach_rc && head_count)
+    {
+        uint32_t b = 0, bl = 0, us = 0;
+        detach_rc = raw_vid_rp_m2m_copy_sg(
+            rp_crx_head_src, rp_crx_head_size, rp_crx_head_scratch,
+            head_count, &b, &bl, &us);
+        detach_bytes += b;
+        detach_blocks += bl;
+        detach_us += us;
+
+        if (!detach_rc)
+        {
+            uint32_t cpu_t0 = get_us_clock();
+            for (uint32_t i = 0; i < head_count; i++)
+                memcpy(rp_crx_head_final[i], rp_crx_head_scratch[i],
+                       rp_crx_head_size[i]);
+            compact_us += (uint32_t)(get_us_clock() - cpu_t0);
+        }
+    }
+
+    if (!detach_rc && bulk_count)
+    {
+        uint32_t b = 0, bl = 0, us = 0;
+        detach_rc = raw_vid_rp_m2m_copy_sg(
+            rp_crx_bulk_src, rp_crx_bulk_size, rp_crx_bulk_dst,
+            bulk_count, &b, &bl, &us);
+        detach_bytes += b;
+        detach_blocks += bl;
+        detach_us += us;
+    }
+
+    if (sem_taken)
+        give_semaphore(edmac_sem);
+
+    if (detach_rc || detach_bytes != payload_bytes ||
+        payload_dst != sample_end)
+    {
+        RP_START_TRACE("CRX exact-pack FAIL f=%d rc=%d seg=%d bytes=%d/%d blocks=%d us=%d dst=%d/%d",
+                       (int)frame_no, detach_rc, (int)segment_count,
+                       (int)detach_bytes, (int)payload_bytes,
+                       (int)detach_blocks, (int)detach_us,
+                       (int)((uintptr_t)payload_dst - (uintptr_t)sample_dst),
+                       (int)sample_size);
+        rp_crx_release_handles(&result, &first_release_rc);
+        rc = -1013;
+        goto fail_no_handle;
+    }
+
+    /* Canon output is now present contiguously in the exact REV2 sample. */
+    release_bad = rp_crx_release_handles(&result, &first_release_rc);
+
+    /*
+     * Give unused max-slot memory forward before publishing FULL.
+     * If the following region is currently busy, defer the physical shrink:
+     * the on-disk block still uses only slot_used bytes and the writer simply
+     * starts a new batch at the next frame.
+     */
+    int shrink_rc = rp_shrink_frame_slot(out_slot, slot_used);
+    if (shrink_rc < 0)
+    {
+        RP_START_TRACE("CRX DYNSLOT shrink FAIL f=%d used=%d cap=%d rc=%d",
+                       (int)frame_no, (int)slot_used,
+                       (int)slot_capacity, shrink_rc);
+        rp_abandon_frame_slot(out_slot);
+        if (out_slot != input_slot)
+            rp_abandon_frame_slot(input_slot);
+        rc = -1028;
+        goto fail_already_released;
+    }
+
+    out_slot->used = slot_used;
+    out_slot->frame_number = frame_no;
+
+    uint32_t frame_space =
+        (uint32_t)(sample_dst - vidf_start - 0x20);
+    RP_START_TRACE("CRX REV2 VIDF f=%d lossy=%d vidf=%d frameSpace=%d sample=%d shrink=%d region=%d exactPack=1 headcpy=%d",
+                   (int)frame_no, lossy ? 1 : 0, (int)vidf_block_size,
+                   (int)frame_space, (int)sample_size,
+                   shrink_rc,
+                   (int)(out_slot->end - out_slot->start),
+                   (int)compact_us);
+
+    /* Queue the stream metadata before frame 0. Both messages are FIFO and all
+     * file writes occur in raw_writer. */
+    if (header_needs_queue)
+    {
+        int header_rc = rp_queue_crx_header_write(
+            header_buf, *mlv_header_size);
+        if (header_rc)
+        {
+            RP_START_TRACE("CRX REV2 header queue FAIL rc=%d", header_rc);
+            rp_abandon_frame_slot(out_slot);
+            if (out_slot != input_slot)
+                rp_abandon_frame_slot(input_slot);
+            rc = -1029;
+            goto fail_already_released;
+        }
+    }
+
+    int write_rc = rp_queue_frame_slot_write(out_slot);
+    if (write_rc)
+    {
+        rp_abandon_frame_slot(out_slot);
+        if (out_slot != input_slot)
+            rp_abandon_frame_slot(input_slot);
+        rc = -1014;
+        goto fail_already_released;
+    }
+
+    if (RP_CRX_ROUNDTRIP_VERIFY && frame_no == 0u)
+    {
+        int ref_rc = rp_hold_crx_reference(
+            input_slot, (uint32_t)event->w, (uint32_t)event->h, bits,
+            frame_no, input_bytes);
+        if (!ref_rc && use_direct_w3)
+            rp_crx_ref_copy_us = ref_copy_us;
+        if (ref_rc)
+        {
+            RP_START_TRACE("CRX REF hold FAIL f=%d rc=%d",
+                           (int)frame_no, ref_rc);
+            /* The revision-2 VIDF is already queued. Stop cleanly after preserving
+             * the file, but do not attempt another frame in this verification build. */
+            rc = -1015;
+            raw_vid_rp_request_stop();
+            raw_vid_request_stop_async();
+            return rc;
+        }
+    }
+
+    (*video_frame_count)++;
+    rp_crx_frames_ok++;
+    rp_crx_total_detach_us += detach_us;
+    rp_crx_total_compact_us += compact_us;
+    rp_crx_total_payload_bytes += sample_size;
+    rp_crx_total_m2m_blocks += detach_blocks;
+
+    /* Diagnostic only. Scale to KiB before multiplying so this stays in
+     * cheap 32-bit arithmetic even for the largest offered RP frames. */
+    uint32_t raw_kib = input_bytes >> 10;
+    uint32_t sample_kib = sample_size >> 10;
+    uint32_t ratio_permille = raw_kib
+                            ? (sample_kib * 1000u) / raw_kib
+                            : 0u;
+    RP_START_TRACE("CRX frame PASS f=%d path=%s fmt=REV2/VIDF bpp=%d raw=%d sample=%d ratio=%d/1000 in=%d ref=%d enc=%d det=%d compact=%d seg=%d vidf=%d used=%d rel=%x",
+                   (int)frame_no, use_direct_w3 ? "W3" : "M2M",
+                   (int)bits, (int)input_bytes,
+                   (int)sample_size, (int)ratio_permille,
+                   (int)input_us, (int)ref_copy_us,
+                   (int)result.encode_us,
+                   (int)detach_us, (int)compact_us,
+                   (int)segment_count, (int)vidf_block_size,
+                   (int)slot_used, first_release_rc);
+
+    if (release_bad)
+    {
+        RP_START_TRACE("CRX release FAIL f=%d rc=%x; stopping after saved frame",
+                       (int)frame_no, first_release_rc);
+        raw_vid_rp_request_stop();
+        raw_vid_request_stop_async();
+    }
+    return 0;
+
+fail_already_released:
+    rp_crx_frames_failed++;
+    raw_vid_rp_request_stop();
+    raw_vid_request_stop_async();
+    return rc;
+
+fail_no_handle:
+    if (out_slot && out_slot != input_slot)
+        rp_abandon_frame_slot(out_slot);
+    if (input_slot)
+        rp_abandon_frame_slot(input_slot);
+    rp_crx_frames_failed++;
+    RP_START_TRACE("CRX frame FAIL f=%d rc=%d", (int)frame_no, rc);
+    raw_vid_rp_request_stop();
+    raw_vid_request_stop_async();
+    return rc;
+}
 static void worker(void)
 {
     #ifdef RAW_VID_LOG
