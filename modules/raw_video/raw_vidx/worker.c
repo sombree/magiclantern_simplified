@@ -319,26 +319,339 @@ static int rp_crx_standard_direct_w3_allowed(void)
      * are no longer user-armable and cannot force staged M2M. */
     return 1;
 }
+
+/* One exact pre-StartEncode input reference for the v6 round-trip test.
+ * rp_crx_ref_slot is never queued to the writer while capture is active. */
+static struct rp_frame_slot *rp_crx_ref_slot = NULL;
+static uint32_t rp_crx_ref_width = 0;
+static uint32_t rp_crx_ref_height = 0;
+static uint32_t rp_crx_ref_bits = 0;
+static uint32_t rp_crx_ref_row_bytes = 0;
+static uint32_t rp_crx_ref_payload_bytes = 0;
+static uint32_t rp_crx_ref_frame_number = 0;
+static uint32_t rp_crx_ref_copy_us = 0;
+
+/* Single worker task owns these scratch arrays.  Keep CRX scatter planning
+ * off the 0x1000-byte raw_v_worker stack.  v21.4 batches all tiny alignment
+ * heads into one R46/W13 SG transaction and all aligned bulk segments into a
+ * second SG transaction, instead of creating/destroying the native resource
+ * up to twice per Canon segment. */
+static uint32_t rp_crx_src_addr[RP_CRX_MAX_SEGMENTS];
+static uint32_t rp_crx_src_size[RP_CRX_MAX_SEGMENTS];
+static uint32_t rp_crx_head_src[RP_CRX_MAX_SEGMENTS];
+static uint32_t rp_crx_head_size[RP_CRX_MAX_SEGMENTS];
+static void *rp_crx_head_scratch[RP_CRX_MAX_SEGMENTS];
+static uint8_t *rp_crx_head_final[RP_CRX_MAX_SEGMENTS];
+static uint32_t rp_crx_bulk_src[RP_CRX_MAX_SEGMENTS];
+static uint32_t rp_crx_bulk_size[RP_CRX_MAX_SEGMENTS];
+static void *rp_crx_bulk_dst[RP_CRX_MAX_SEGMENTS];
+
+/* Stage 35 writer-phase guard.  The 4K failure signature is a large FIO
+ * write entering the storage stack immediately before evfVDInterruptCBR /
+ * blanking.  A successful M2M crop completes early enough in the following
+ * frame cycle to provide a cheap task-context phase reference without adding
+ * any work to Canon IRQ/callback paths. */
+static volatile uint32_t rp_last_m2m_complete_us = 0;
+
+static void rp_wait_fio_safe_phase(void)
+{
+    if (!is_camera("RP", "1.6.0") || RP_START_PROBE_STAGE != 35)
+        return;
+
+    const uint32_t fresh_us = 6000u;
+    const uint32_t timeout_us = 70000u;
+    uint32_t wait_start = get_us_clock();
+
+    while (1)
+    {
+        uint32_t now = get_us_clock();
+        uint32_t last = rp_last_m2m_complete_us;
+        uint32_t age = now - last;
+
+        if (last != 0 && age <= fresh_us)
+        {
+            RP_START_TRACE("S35 FIO phase PASS age=%d wait=%d",
+                           (int)age, (int)(now - wait_start));
+            return;
+        }
+
+        if ((uint32_t)(now - wait_start) >= timeout_us)
+        {
+            RP_START_TRACE("S35 FIO phase TIMEOUT last=%x age=%d",
+                           last, (int)age);
+            return;
+        }
+
+        msleep(1);
+    }
+}
+
+static struct mlv_session session = {
+    .fps = 0,
+    .res_x = 0,
+    .res_y = 0,
+    .bits_per_pixel = 14,
+    .crop_offset_x = 0, // FIXME we want these correct so mlvapp can do FPM stuff, etc
+    .crop_offset_y = 0,
+    .pan_offset_x = 0,
+    .pan_offset_y = 0,
+    .image_data_alignment = EDMAC_ALIGNMENT,
+    .native_crx = 0
+};
+
 enum recording_state get_recording_state(void)
 {
     return recording_state;
 }
 
 // lv_save_raw trick (which we trigger indirectly via raw.c, raw_lv_request(),
-// has given us a buffer of whatever size DryOS wants for fullsize LV.  We can
-// crop this down with edmac_copy_rectangle_cbr_start(), DMA based and fast enough
-// to do each frame.
+// has given us a buffer of whatever size DryOS wants for fullsize LV.
+// This experimental raw_vidx build is RP-only and crops synchronously on CPU;
+// RP mem-to-mem EDMAC helpers are intentionally not referenced.
 struct crop_buf 
 {
     char *_buf; // Unaligned, underlying buffer, used with malloc/free.
     char *start; // Start of aligned buf, for DMA ops, etc.
     char *cur; // Position that data should write to.
     char *end; // Do not write to this location or later.
+    volatile int writing; // asynchronous FIO task owns this buffer
 };
 
-// Finds two large, aligned blocks, of equal size,
-// for accumulating potentially cropped frame data in,
-// before writing to disk.
+static int rp_slot_lock(void)
+{
+    if (rp_slot_sem == NULL)
+        return -1;
+    return take_semaphore(rp_slot_sem, 1000);
+}
+
+static void rp_slot_unlock(void)
+{
+    if (rp_slot_sem != NULL)
+        give_semaphore(rp_slot_sem);
+}
+
+static uint32_t rp_slot_region_size_locked(uint32_t i)
+{
+    if (i >= rp_frame_slot_count ||
+        rp_frame_slots[i].start == NULL ||
+        rp_frame_slots[i].end < rp_frame_slots[i].start)
+    {
+        return 0;
+    }
+    return (uint32_t)(rp_frame_slots[i].end - rp_frame_slots[i].start);
+}
+
+static uint32_t rp_count_free_frame_slots_locked(void)
+{
+    uint32_t free_count = 0;
+    for (uint32_t i = 0; i < rp_frame_slot_count; i++)
+    {
+        if (rp_frame_slots[i].state == RP_FRAME_SLOT_FREE)
+            free_count++;
+    }
+    return free_count;
+}
+
+/* Count truly usable FREE bytes, not nominal suites or RESERVED descriptors.
+ * Conservative at pressure boundaries: RESERVED bytes require a later merge. */
+static uint32_t rp_v112_free_bytes_locked(void)
+{
+    uint64_t bytes = 0u;
+    for (uint32_t i = 0; i < rp_frame_slot_count; ++i)
+        if (rp_frame_slots[i].state == RP_FRAME_SLOT_FREE &&
+            rp_slot_region_size_locked(i) >= rp_frame_slot_stride)
+            bytes += rp_slot_region_size_locked(i);
+    return bytes > UINT32_MAX ? UINT32_MAX : (uint32_t)bytes;
+}
+
+static uint32_t rp_v112_free_bytes(void)
+{
+    if (rp_slot_lock()) return 0u;
+    uint32_t bytes = rp_v112_free_bytes_locked();
+    rp_slot_unlock();
+    return bytes;
+}
+
+static uint32_t rp_count_reserved_frame_slots_locked(void)
+{
+    uint32_t reserved = 0;
+    for (uint32_t i = 0; i < rp_frame_slot_count; i++)
+    {
+        if (rp_frame_slots[i].state == RP_FRAME_SLOT_RESERVED)
+            reserved++;
+    }
+    return reserved;
+}
+
+static uint32_t rp_count_free_frame_slots(void)
+{
+    if (rp_slot_lock())
+        return 0;
+    uint32_t free_count = rp_count_free_frame_slots_locked();
+    rp_slot_unlock();
+    return free_count;
+}
+
+static uint32_t rp_count_reserved_frame_slots(void)
+{
+    if (rp_slot_lock())
+        return 0;
+    uint32_t reserved = rp_count_reserved_frame_slots_locked();
+    rp_slot_unlock();
+    return reserved;
+}
+
+static int rp_slot_index(const struct rp_frame_slot *slot)
+{
+    if (slot < &rp_frame_slots[0] || slot >= &rp_frame_slots[RP_FRAME_SLOT_MAX])
+        return -1;
+    return (int)(slot - &rp_frame_slots[0]);
+}
+
+static struct rp_frame_slot *rp_find_full_frame_slot_locked(uint32_t frame_number)
+{
+    for (uint32_t i = 0; i < rp_frame_slot_count; i++)
+    {
+        if (rp_frame_slots[i].state == RP_FRAME_SLOT_FULL &&
+            rp_frame_slots[i].frame_number == frame_number)
+        {
+            return &rp_frame_slots[i];
+        }
+    }
+    return NULL;
+}
+
+static struct rp_frame_slot *rp_v112_claim_slot_locked(uint32_t i)
+{
+    struct rp_frame_slot *slot = &rp_frame_slots[i];
+    slot->state = RP_FRAME_SLOT_CAPTURING;
+    slot->used = 0u;
+    rp_frame_slot_cursor = (i + 1u) % rp_frame_slot_count;
+    rp_v112_last_capture = i;
+    return slot;
+}
+
+/* Capture sequentially through the metadata ring whenever possible.
+ *
+ * shrink_slot-style redistribution makes the metadata entry immediately after
+ * a compressed frame physically adjacent and FREE.  Keeping the cursor on that
+ * next entry is what turns variable-size compressed frames into large
+ * zero-copy FIO groups. */
+static struct rp_frame_slot *rp_get_free_frame_slot(void)
+{
+    if (rp_frame_slot_count == 0 || rp_slot_lock())
+        return NULL;
+
+    /* Prefer the byte immediately following the last *finished* frame,
+     * even if a concurrent writer changed the metadata cursor. Validate
+     * physical adjacency and FREE ownership under the same slot semaphore. */
+    if (rp_v112_last_capture < rp_frame_slot_count)
+    {
+        uint32_t prev_i = rp_v112_last_capture;
+        struct rp_frame_slot *prev = &rp_frame_slots[prev_i];
+        if ((prev->state == RP_FRAME_SLOT_FULL ||
+             prev->state == RP_FRAME_SLOT_WRITING) && prev->used &&
+            prev_i + 1u < rp_frame_slot_count)
+        {
+            struct rp_frame_slot *next = &rp_frame_slots[prev_i + 1u];
+            if (next->chunk_index == prev->chunk_index &&
+                next->state == RP_FRAME_SLOT_FREE &&
+                next->start == prev->start + prev->used &&
+                rp_slot_region_size_locked(prev_i + 1u) >= rp_frame_slot_stride)
+            {
+                rp_v112_tail_hits++;
+                struct rp_frame_slot *out = rp_v112_claim_slot_locked(prev_i + 1u);
+                rp_slot_unlock();
+                return out;
+            }
+        }
+    }
+
+    /* Fast path: keep rolling through the physical run created by the last
+     * shrink, exactly like mlv_lite::choose_next_capture_slot(). */
+    if (rp_frame_slot_cursor < rp_frame_slot_count &&
+        rp_frame_slots[rp_frame_slot_cursor].state == RP_FRAME_SLOT_FREE &&
+        rp_slot_region_size_locked(rp_frame_slot_cursor) >= rp_frame_slot_stride)
+    {
+        uint32_t i = rp_frame_slot_cursor;
+        struct rp_frame_slot *out = rp_v112_claim_slot_locked(i);
+        rp_slot_unlock();
+        return out;
+    }
+
+    /* When the sequential run is blocked, start at the largest physically
+     * contiguous FREE run.  A simple first-free scan needlessly fragments
+     * compressed batches and was one of the differences from the older
+     * stable v3C/mlv_lite allocator. */
+    uint32_t best_start = RP_FRAME_SLOT_MAX;
+    uint64_t best_bytes = 0u;
+    uint32_t best_len = 0u;
+
+    for (uint32_t c = 0; c < rp_frame_chunk_count; c++)
+    {
+        uint32_t first = rp_frame_chunks[c].first_slot;
+        uint32_t count = rp_frame_chunks[c].slot_count;
+        uint32_t run_start = first;
+        uint32_t run_len = 0u;
+        uint64_t run_bytes = 0u;
+        char *prev_end = NULL;
+
+        for (uint32_t n = 0; n < count; n++)
+        {
+            uint32_t i = first + n;
+            if (i >= rp_frame_slot_count)
+                break;
+
+            struct rp_frame_slot *slot = &rp_frame_slots[i];
+            int usable_free =
+                slot->state == RP_FRAME_SLOT_FREE &&
+                rp_slot_region_size_locked(i) >= rp_frame_slot_stride;
+
+            if (usable_free)
+            {
+                if (run_len == 0u || slot->start != prev_end)
+                {
+                    run_start = i;
+                    run_len = 1u;
+                    run_bytes = 0u;
+                }
+                else
+                {
+                    run_len++;
+                }
+                run_bytes += rp_slot_region_size_locked(i);
+                prev_end = slot->end;
+
+                /* Prefer actual writable bytes, not metadata cardinality.
+                 * Stable tie-break on descriptor count for equal sizes. */
+                if (run_bytes > best_bytes ||
+                    (run_bytes == best_bytes && run_len > best_len))
+                {
+                    best_bytes = run_bytes;
+                    best_len = run_len;
+                    best_start = run_start;
+                }
+            }
+            else
+            {
+                run_len = 0u;
+                run_bytes = 0u;
+                prev_end = NULL;
+            }
+        }
+    }
+
+    if (best_start >= rp_frame_slot_count)
+    {
+        rp_slot_unlock();
+        return NULL;
+    }
+
+    rp_v112_fallbacks++;
+    struct rp_frame_slot *out = rp_v112_claim_slot_locked(best_start);
+    rp_slot_unlock();
+    return out;
+}
 static void alloc_crop_bufs(struct crop_buf crop_bufs[])
 {
     if (crop_bufs[0]._buf != NULL
