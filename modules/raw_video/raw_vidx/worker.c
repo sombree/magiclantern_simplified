@@ -4962,6 +4962,20 @@ static void worker(void)
 
         // Note that we must reach here from every case above,
         // or we will leak events and starve the queue.
+        /*
+         * RP IMAGE_DATA events are emitted only after hardware Complete.
+         * The RP CPU crop above is synchronous, so the full-frame source may
+         * return to FREE here even if this frame was dropped by the worker.
+         */
+        if (event->type == COMMAND_START && event->still_session &&
+            recording_state != ACTIVE)
+        {
+            RP_START_TRACE("STILL start failed or rejected, worker inactive");
+            rp_still_session_active = 0u;
+            raw_vid_still_session_finish();
+        }
+        if (event->capture_slot >= 0 && is_camera("RP", "1.6.0"))
+            raw_vid_rp_release_buffer(event->capture_slot);
         release_event(event);
 
         // no sleep needed, queue receive with timeout 0 is blocking.
