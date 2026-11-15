@@ -2404,3 +2404,188 @@ static int rp_native_get_roots(struct rp_native_roots *r)
         return -5;
     return 0;
 }
+
+static void rp_native_log_roots(const char *tag, unsigned epoch,
+                                const struct rp_native_roots *r)
+{
+    RP_CRX_TRACE("NATIVE %s epoch=%d mgr=%x backend=%x mode=%x",
+                 tag, (int)epoch, r->mgr, r->backend, r->mode);
+    RP_CRX_TRACE("NATIVE ARENA scratch=%x len=%x base=%x size=%x cur=%x",
+                 r->scratch, r->scratch_size, r->base, r->size, r->cursor);
+    RP_CRX_TRACE("NATIVE QUEUE pending=%x res=%x d=%d q=%d ctx=%x",
+                 r->event_queue, r->resource_first,
+                 (int)r->free_d, (int)r->free_q, r->ctx_base);
+}
+
+static void rp_native_log_latches(const struct rp_native_roots *r)
+{
+    for (unsigned i=0;i<RP_CRX_ALGSMGR_LATCH_COUNT;i+=4)
+    {
+        /* Each line logs up to four consecutive IDs. Never %u on RP. */
+        if (i+3 < RP_CRX_ALGSMGR_LATCH_COUNT)
+            RP_CRX_TRACE("NATIVE LATCH ids=%d..%d %x,%x,%x,%x",
+                         (int)i,(int)(i+3),r->latch[i],r->latch[i+1],
+                         r->latch[i+2],r->latch[i+3]);
+        else
+            RP_CRX_TRACE("NATIVE LATCH ids=%d..%d %x,%x",
+                         (int)i,(int)(RP_CRX_ALGSMGR_LATCH_COUNT-1),
+                         r->latch[i],r->latch[i+1]);
+    }
+}
+
+void raw_vid_rp_crx_nativewatch_task(void *unused)
+{
+    (void)unused;
+    static const unsigned spans_ms[] = {0u,120000u,300000u,600000u};
+    struct rp_native_roots prev;
+    struct rp_crx_bank_snapshot last_bank[RP_NATIVE_BANK_COUNT];
+    uint8_t last_bank_valid[RP_NATIVE_BANK_COUNT] = {0};
+    int prev_valid = 0, active_mode = 0, invalid_reason = 0;
+    unsigned epoch = 0u, stable = 0u, samples = 0u;
+    uint32_t begin_ms = 0;
+    memset(&prev,0,sizeof(prev));
+    memset(last_bank,0,sizeof(last_bank));
+    for (;;)
+    {
+        msleep(RP_NATIVE_WATCH_POLL_MS);
+        int requested = raw_vid_get_native_crx_watch_mode();
+        if (requested < 0 || requested > 3) requested = 0;
+        if (!requested)
+        {
+            if (active_mode)
+                RP_CRX_TRACE("NATIVE END user-off epochs=%d samples=%d",
+                             (int)epoch,(int)samples);
+            active_mode = 0;
+            prev_valid = 0;
+            continue;
+        }
+        if (requested != active_mode)
+        {
+            active_mode = requested;
+            prev_valid = 0;
+            stable = 0;
+            epoch = 0;
+            samples = 0;
+            invalid_reason = 0;
+            memset(last_bank_valid,0,sizeof(last_bank_valid));
+            begin_ms = get_ms_clock();
+            RP_CRX_TRACE("NATIVE START duration_ms=%d period_ms=%d",
+                         (int)spans_ms[requested], (int)RP_NATIVE_WATCH_POLL_MS);
+        }
+        unsigned elapsed = (uint32_t)(get_ms_clock() - begin_ms);
+        if (elapsed >= spans_ms[active_mode])
+        {
+            RP_CRX_TRACE("NATIVE END timeout epochs=%d samples=%d",
+                         (int)epoch,(int)samples);
+            raw_vid_disarm_native_crx_watch(active_mode);
+            active_mode = 0;
+            prev_valid = 0;
+            continue;
+        }
+        struct rp_native_roots now;
+        int rc = rp_native_get_roots(&now);
+        samples++;
+        if (rc)
+        {
+            if (prev_valid || invalid_reason != rc)
+                RP_CRX_TRACE("NATIVE unavailable rc=%d mgr=%x backend=%x t=%d",
+                             rc,now.mgr,now.backend,(int)elapsed);
+            invalid_reason = rc;
+            prev_valid = 0;
+            stable = 0;
+            memset(last_bank_valid,0,sizeof(last_bank_valid));
+            continue;
+        }
+        invalid_reason = 0;
+        int changed_root = !prev_valid ||
+            now.mgr != prev.mgr || now.backend != prev.backend ||
+            now.mode != prev.mode || now.base != prev.base ||
+            now.size != prev.size || now.ctx_base != prev.ctx_base ||
+            now.scratch != prev.scratch;
+        if (changed_root)
+        {
+            if (prev_valid && now.mgr==prev.mgr &&
+                now.backend==prev.backend && now.base==prev.base &&
+                now.size==prev.size && now.cursor<prev.cursor)
+                RP_CRX_TRACE("NATIVE REWIND mode-change %x->%x cursor=%x->%x",
+                             prev.mode,now.mode,prev.cursor,now.cursor);
+            if (prev_valid && now.mode!=prev.mode)
+                RP_CRX_TRACE("NATIVE MODE t=%d %x->%x",
+                             (int)elapsed,prev.mode,now.mode);
+            epoch++;
+            stable = 0;
+            memset(last_bank_valid,0,sizeof(last_bank_valid));
+            rp_native_log_roots(prev_valid ? "EPOCH" : "BASE",epoch,&now);
+            rp_native_log_latches(&now);
+        }
+        else
+        {
+            stable++;
+            if (now.cursor < prev.cursor)
+                RP_CRX_TRACE("NATIVE REWIND epoch=%d before=%x after=%x delta=%x",
+                             (int)epoch,prev.cursor,now.cursor,prev.cursor-now.cursor);
+            if (now.cursor != prev.cursor)
+                RP_CRX_TRACE("NATIVE CUR t=%d epoch=%d old=%x now=%x",
+                             (int)elapsed,(int)epoch,prev.cursor,now.cursor);
+            if (now.free_d != prev.free_d || now.free_q != prev.free_q ||
+                now.resource_first != prev.resource_first ||
+                now.event_queue != prev.event_queue)
+                RP_CRX_TRACE("NATIVE RESOURCE t=%d res=%x d=%d q=%d wait=%x",
+                             (int)elapsed,now.resource_first,
+                             (int)now.free_d,(int)now.free_q,now.event_queue);
+            for (unsigned i=0;i<RP_CRX_ALGSMGR_LATCH_COUNT;i++)
+                if (now.latch[i]!=prev.latch[i])
+                    RP_CRX_TRACE("NATIVE LATCH CHANGE t=%d id=%d %x->%x",
+                                 (int)elapsed,(int)i,prev.latch[i],now.latch[i]);
+        }
+        /* Contexts are D-only and dereferenced only after two samples in
+         * a stable manager/backend epoch, with independent pointer guards. */
+        if (stable>=2u && now.mode == RP_CRX_MODE_LOSSLESS &&
+            rp_crx_ram_ptr(now.ctx_base) &&
+            now.ctx_base <= 0xBFFFFFFFu-
+                (RP_CRX_CONTEXT_STRIDE*RP_CRX_ALGSMGR_LATCH_COUNT))
+        {
+            for (unsigned i=0;i<RP_NATIVE_BANK_COUNT;i++)
+            {
+                struct rp_crx_bank_snapshot b;
+                uint32_t id=g_watch_ids[i];
+                if (rp_crx_bank_snapshot(now.mgr,id,&b) ||
+                    !rp_crx_snapshot_arena_valid(&b) ||
+                    b.backend!=now.backend || b.mode!=now.mode ||
+                    b.cursor!=now.cursor)
+                    continue;
+                if (!last_bank_valid[i] ||
+                    b.hw_active!=last_bank[i].hw_active ||
+                    b.context!=last_bank[i].context ||
+                    memcmp(b.pointers,last_bank[i].pointers,sizeof(b.pointers)))
+                {
+                    RP_CRX_TRACE("NATIVE BANK t=%d id=%d hw=%d latch=%d",
+                                 (int)elapsed,(int)id,(int)b.hw_active,(int)b.latch);
+                    RP_CRX_TRACE("NATIVE P id=%d %x,%x,%x,%x,%x",
+                                 (int)id,b.pointers[0],b.pointers[1],b.pointers[2],
+                                 b.pointers[3],b.pointers[4]);
+                    last_bank[i]=b;
+                    last_bank_valid[i]=1;
+                }
+            }
+        }
+        if ((samples%200u)==0u)
+            RP_CRX_TRACE("NATIVE ALIVE t=%d epoch=%d mode=%x cursor=%x",
+                         (int)elapsed,(int)epoch,now.mode,now.cursor);
+        prev=now;
+        prev_valid=1;
+    }
+}
+
+void raw_vid_rp_crx_get_stats(struct rp_crx_stats *out)
+{
+    if (!out)
+        return;
+    rp_crx_barrier();
+    *out = g_stats;
+    out->poisoned = g_poisoned;
+    out->encoder_latched_bits = g_encoder_latched_bits;
+    out->free_pending = g_free_pending;
+    out->free_completed = g_free_completed;
+    out->free_callback_errors = g_free_callback_errors;
+}
