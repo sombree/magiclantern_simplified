@@ -2,6 +2,7 @@
 #include "dryos.h"
 #include "raw.h" // raw_info global, raw_lv_redirect_edmac()
 #include "zebra.h" // liveview_display_idle()
+#include "menu.h"
 
 // Ugly - we use propvalues.c to hold various globals
 // and functions that are nothing to do with properties,
@@ -10,10 +11,13 @@
 // E.g. is_movie_mode(), set_recording_custom(),
 // various RECORDING macros.
 #include "propvalues.h"
+#include "property.h"
 
 #include "raw_vid.h"
 #include "raw_vid_event_pusher.h"
 #include "raw_vid_worker.h"
+#include "rp_backend.h"
+#include "rp_w3_matrix.h"
 
 #if RAW_VID_Q_LEN < 5
     #error "RAW_VID_Q_LEN too short"
@@ -23,7 +27,7 @@
 //#define MLV_3_CROP_WIDTH 1600
 //#define MLV_3_CROP_HEIGHT 900
 
-// This is 64.3MB/s at 24fps
+// This is 64.3MB/s at 24fps (legacy/default path).
 #define MLV_3_CROP_WIDTH 1792
 #define MLV_3_CROP_HEIGHT 896
 
@@ -118,6 +122,7 @@ struct raw_vid_event *get_empty_event(void)
     {
         memset(event, 0, sizeof(*event));
         event->type = PREPARING;
+        event->capture_slot = -1;
     }
 
     give_semaphore(events_sem);
@@ -142,11 +147,13 @@ void allow_recording(void)
     prevent_recording = 0;
 }
 
-void init_event_pusher(struct msg_queue *q)
+
+
+int init_event_pusher(struct msg_queue *q)
 {
-    // Not much init, most of the work is done by the CBR funcs.
     event_q = q;
-    events_sem = create_named_semaphore(NULL, SEM_CREATE_UNLOCKED);
+    events_sem = create_named_semaphore("raw_vid_events", SEM_CREATE_UNLOCKED);
+    return events_sem ? 0 : -1;
 }
 
 // Send stop command, handling the possiblity that the queue
@@ -163,6 +170,8 @@ void init_event_pusher(struct msg_queue *q)
 // timing critical CBR contexts.
 static void send_stop_command(void)
 {
+    if (is_camera("RP", "1.6.0"))
+        raw_vid_rp_request_stop();
     prevent_recording = 1;
     SEND_LOG_DATA_STR("Sending stop command to worker\n");
 
@@ -201,239 +210,288 @@ static void send_stop_command(void)
     }
 }
 
-// Here we judge if the keypress should start or stop recording.
-// We also suppress some events during recording.
-//
-// This is a slightly simplified copy of the logic in mlv_lite.c
-//
-// We must return 1 if we are not suppressing the event;
-// that is, if we want to give other code a chance to handle the event.
-static unsigned int raw_vid_keypress_cbr(unsigned int key)
+void raw_vid_request_stop_async(void)
 {
-    if (!is_movie_mode()) // in propvalues.c
-        return 1;
-
-    // keys are only hooked in LiveView
-    if (!liveview_display_idle())
-        return 1;
-
-    // if you somehow managed to start recording H.264, let it stop
-    if (RECORDING_H264)
-        return 1;
-
-    // Fetch recording state when rec key pressed.
-    // Theoretically this can change before we use it,
-    // but the window is small and the worst case outcome is
-    // not a real problem; we either start or stop recording inappropriately.
-    enum recording_state recording_state = get_recording_state();
-
-    // block the zoom key while recording
-    if (recording_state == INACTIVE
-        && key == MODULE_KEY_PRESS_ZOOMIN)
-        return 0;
-
-    // start/stop recording with the LiveView key
-    int rec_key_pressed = (key == MODULE_KEY_LV || key == MODULE_KEY_REC);
-
-    if (rec_key_pressed)
-    {
-        SEND_LOG_DATA_STR("REC key pressed.\n");
-
-        if (event_q == NULL)
-        {
-            // not initialized; block the event
-            return 0;
-        }
-
-        if (recording_state == ACTIVE)
-        {
-            // We wish to stop recording.
-            SEND_LOG_DATA_STR("Sending stop com due to rec keypress.\n");
-            // task_create to avoid blocking in key handling cbr:
-            task_create("stop_com", WORKER_PRIO + 1, 0x800, send_stop_command, NULL);
-        }
-        else if (recording_state == INACTIVE)
-        {
-            // Trying to start recording.
-            struct raw_vid_event *event = get_empty_event();
-            if (event != NULL)
-            {
-                event->creation_time = get_ms_clock();
-                event->type = COMMAND_START;
-                // FIXME we should take these from menu config when we have that
-                event->w = MLV_3_CROP_WIDTH;
-                event->h = MLV_3_CROP_HEIGHT;
-                msg_queue_post(event_q, (uint32_t)event);
-            }
-            // If we were trying to start recording and there was an earlier
-            // error, we won't try to send the start signal.  Which is okay.
-        }
-
-        // In other states, we ignore the button
-        return 0;
-    }
-
-    return 1;
+    task_create("stop_com", WORKER_PRIO + 1, 0x800, send_stop_command, NULL);
 }
 
-// src/raw.c makes this fire every LV vsync (which I guess is tied to every sensor capture?).
-// In any case, it works to get 60fps captures on 200D.
-static unsigned int FAST raw_vid_vsync_cbr(unsigned int unused)
+/* v111: Still Photo LiveView is a normal recorder session.  The physical
+ * REC key is used when forwarded by RP; the Movie-menu Start/Stop action is
+ * a fallback. The watcher only requests the existing orderly worker STOP. */
+static volatile int still_session_pending = 0;
+static volatile int still_session_stop_sent = 0;
+static volatile uint32_t still_session_requested_ms = 0;
+static volatile uint32_t still_session_active_ms = 0;
+static volatile uint32_t still_session_last_frame_ms = 0;
+static volatile uint32_t still_session_frame_count = 0;
+static volatile int still_session_start_shootmode = 0;
+static volatile int raw_record_menu_pending = 0;
+static volatile int still_session_watch_ready = 0;
+
+#define STILL_SESSION_START_TIMEOUT_MS 15000u
+#define STILL_SESSION_NO_FRAME_TIMEOUT_MS 7000u
+#define STILL_MENU_CLOSE_TIMEOUT_MS 5000u
+
+int raw_vid_still_mode_ok(void)
 {
-    static int count = 0; // frame count, reset every recording session
-    struct raw_vid_event *event = NULL;
+    /* Only the physical photo position, never an H264/movie session.
+     * Do not use liveview_display_idle(): it is not validated on RP. */
+    return still_session_watch_ready && lv && !is_movie_mode() &&
+           shooting_mode != SHOOTMODE_MOVIE && !RECORDING_H264;
+}
 
-    // The cam will capture sensor data for display on LV.
-    // Without needing to modify *what* the cam captures (which is hard),
-    // we can change *where* the data goes.  This happens to be easy
-    // because of how EDMAC works (and which parts we understand well).
-    //
-    // We don't know precisely when the EDMAC capture will finish, only
-    // that it is in the future.  But we do know it must finish before
-    // the next vsync, or LV would hang.
-    //
-    // Therefore we double buffer capture, changing where cam saves the
-    // data every vsync. That means we know the older captured frame has
-    // completed capture.
-    //
-    // We message worker.c with the details of this captured frame.
-    // It optionally crops out a region of interest, and saves to disk.
-
-    static char *capture_frames[2] = {NULL};
-    static char *frame = NULL; // current capture_frame in use
-
-    if (get_recording_state() != ACTIVE)
-        return 0;
-
-    if (prevent_recording)
+void raw_vid_still_session_stop_once(void)
+{
+    if (still_session_pending && !still_session_stop_sent)
     {
-        // Consumer thinks recording is active, but something on this,
-        // the producer side, has requested stop.  This should mean the recording
-        // has very recently stopped.  Reset session.
-        //
-        // Consumer will re-enable recording when it is ready.
-        count = 0;
-        if (capture_frames[0] != NULL)
+        still_session_stop_sent = 1;
+        DryosDebugMsg(0, 15, "RPVIDX STILL STOP request frame=%d", (int)still_session_frame_count);
+        /* Check task creation, unlike the historical generic async helper.
+         * A failed STOP task must not permanently disable the REC fallback. */
+        uint32_t tid = task_create("stop_com", WORKER_PRIO + 1, 0x800,
+                                   send_stop_command, NULL);
+        if (!tid)
         {
-            fio_free(capture_frames[0]);
-            capture_frames[0] = NULL;
-        }
-        if (capture_frames[1] != NULL)
-        {
-            fio_free(capture_frames[1]);
-            capture_frames[1] = NULL;
-        }
-        return 0;
-    }
-
-    // In worker.c we request LV changes to raw mode, which takes some time.
-    // When it occurs, raw_info global struct gets updated with the raw dimensions.
-    if (raw_info.width == 0
-        || raw_info.height == 0)
-    {
-        return 0;
-    }
-
-    count++;
-    if (count == 1)
-    { // per recording-session setup
-        SEND_LOG_DATA_STR("Video starting.\n");
-
-        // We lie a little to increase height, we want to slightly over-allocate.
-        // Old code does this, not quite sure why, perhaps DMA block size related?
-        const uint32_t lv_raw_size = raw_info.width * (raw_info.height + 2) * BPP/8;
-        capture_frames[0] = fio_malloc(lv_raw_size);
-
-        if (capture_frames[0] == NULL)
-        {
-            SEND_LOG_DATA_STR("Could not alloc capture_frames[0]\n");
-
-            // This is likely unrecoverable, stop recording
-            task_create("stop_com", WORKER_PRIO + 1, 0x800, send_stop_command, NULL);
-            return 0;
-        }
-        capture_frames[1] = fio_malloc(lv_raw_size);
-        if (capture_frames[1] == NULL)
-        {
-            SEND_LOG_DATA_STR("Could not alloc capture_frames[1]\n");
-            fio_free(capture_frames[0]);
-            capture_frames[0] = NULL;
-
-            // This is likely unrecoverable, stop recording
-            task_create("stop_com", WORKER_PRIO + 1, 0x800, send_stop_command, NULL);
-            return 0;
-        }
-
-        frame = capture_frames[0];
-    }
-
-    event = get_empty_event();
-    if (event == NULL)
-    {
-        // We have filled the queue.  This should mean the consumer is not keeping up.
-        // We have to stop.
-
-        // TODO classic MLV supports user choosing stop or skip frames,
-        // logic for skipping frames would go in here, perhaps some loop with a sleep,
-        // waiting for queue space to be available.
-        SEND_LOG_DATA_STR("All events are non-empty, stopping\n");
-
-        task_create("stop_com", WORKER_PRIO + 1, 0x800, send_stop_command, NULL);
-        return 0;
-    }
-
-    event->creation_time = get_ms_clock();
-    event->type = IMAGE_DATA;
-
-    event->orig_frame_width = raw_info.pitch;
-
-    // TODO allow choosing offset and crop?
-    event->x = 200; // x offset within the frame, for cropping
-    event->y = 100; // y as above
-    event->w = MLV_3_CROP_WIDTH;
-    event->h = MLV_3_CROP_HEIGHT;
-
-    int32_t frame_size = event->w * event->h * BPP/8;
-    event->size = frame_size;
-
-    // Send prior captured data to worker for cropping
-    // and writing
-    if (frame != NULL)
-        event->src = frame;
-
-    // Swap buffer in use
-    if (frame == capture_frames[0])
-    {
-        frame = capture_frames[1];
-    }
-    else
-    {
-        frame = capture_frames[0];
-    }
-
-    // Make the next LV EDMAC capture go to updated buffer
-    if (frame != NULL)
-        raw_lv_redirect_edmac(frame);
-
-    // Don't send request on first vsync, we've set up for EDMAC capture
-    // but it hasn't had time to run.
-    if (count > 1)
-    {
-        int err = msg_queue_post(event_q, (uint32_t)event);
-        if (err)
-        {
-            // queue was full, should mean card writes aren't keeping up,
-            // we should stop.
-            task_create("stop_com", WORKER_PRIO + 1, 0x800, send_stop_command, NULL);
+            still_session_stop_sent = 0;
+            DryosDebugMsg(0, 15, "RPVIDX STILL STOP task create FAILED");
         }
     }
+}
 
-//ASSERT(frame_size_uncompressed % 4 == 0);
+void raw_vid_still_session_frame_seen(uint32_t frames)
+{
+    if (still_session_pending)
+    {
+        still_session_frame_count = frames;
+        still_session_last_frame_ms = get_ms_clock();
+    }
+}
 
+void raw_vid_still_session_finish(void)
+{
+    if (still_session_pending)
+        DryosDebugMsg(0, 15, "RPVIDX STILL END frame=%d state=%d",
+                      (int)still_session_frame_count, (int)get_recording_state());
+    still_session_pending = 0;
+    still_session_stop_sent = 0;
+    still_session_active_ms = 0;
+}
+
+static void raw_vid_still_watch_task(void *unused)
+{
+    (void)unused;
+    TASK_LOOP
+    {
+        msleep(250);
+        if (!still_session_pending) continue;
+        uint32_t now = get_ms_clock();
+        enum recording_state state = get_recording_state();
+        if (state == ACTIVE)
+        {
+            if (!still_session_active_ms)
+            {
+                still_session_active_ms = now;
+                still_session_last_frame_ms = now;
+                DryosDebugMsg(0, 15, "RPVIDX STILL watchdog ACTIVE mode=%d",
+                              (int)still_session_start_shootmode);
+            }
+            if (!still_session_stop_sent &&
+                (!raw_vid_still_mode_ok() ||
+                shooting_mode != still_session_start_shootmode ||
+                now - still_session_last_frame_ms > STILL_SESSION_NO_FRAME_TIMEOUT_MS))
+            {
+                DryosDebugMsg(0, 15, "RPVIDX STILL watchdog STOP mode=%d lv=%d frames=%d age=%d",
+                              shooting_mode, lv, (int)still_session_frame_count,
+                              (int)(now - still_session_last_frame_ms));
+                raw_vid_still_session_stop_once();
+            }
+        }
+        else if (!still_session_stop_sent && !still_session_active_ms &&
+                 now - still_session_requested_ms > STILL_SESSION_START_TIMEOUT_MS)
+        {
+            /* A failed COMMAND_START is handled by worker cleanup.  For a
+             * stalled start enqueue STOP once; never block the watcher. */
+            DryosDebugMsg(0, 15, "RPVIDX STILL START timeout; requesting STOP");
+            raw_vid_still_session_stop_once();
+        }
+    }
+}
+
+void raw_vid_still_watch_start(void)
+{
+    still_session_watch_ready = !!task_create("rp_stillwatch", WORKER_PRIO + 1,
+                                             0x1000, raw_vid_still_watch_task, NULL);
+    DryosDebugMsg(0, 15, "RPVIDX STILL watcher ready=%d", still_session_watch_ready);
+}
+
+/* EOS RP native REC event 0x28, handled for both Movie and photo LV.
+ * Some photo GUI modes may not forward this key; the normal menu action
+ * supplies an alternative without enabling any test mode. */
+#define RP_RAWVID_REC_PRESS 0x28u
+
+/* Historical W3 matrix launcher is retained for source compatibility;
+ * ordinary REC never calls it. */
+int rp_w3_matrix_send_start(int bpp)
+{
+    if (!event_q || get_recording_state() != INACTIVE || prevent_recording)
+        return -1;
+    struct raw_vid_event *e = get_empty_event();
+    if (!e) return -2;
+    e->creation_time = get_ms_clock();
+    e->type = COMMAND_START;
+    e->requested_bpp = bpp;
+    e->wire_le16 = 0; /* Matrix Single selects its own wire mode. */
+    e->resolution_mode = RAW_VID_RES_W3_TRANSPORT;
+    e->codec_mode = RAW_VID_CODEC_RAW; /* never touch Canon CRX persistent banks */
+    e->crx_frame_limit = 0;
+    e->crx_latch_stop_mode = RAW_VID_CRX_LATCH_OFF;
+    e->crx_session_budget = 0;
+    e->crx_stillwatch = 0;
+    e->crx_allow_id0_still = 0;
+    if (msg_queue_post(event_q, (uint32_t)e))
+    {
+        release_event(e);
+        return -3;
+    }
     return 0;
 }
 
+/* v111: one REC path for Movie and Still Photo LiveView. The session type
+ * is separate from any frame-limit policy. No diagnostic opt-in gates exist. */
+static unsigned int raw_vid_rp_rec_press(void)
+{
+    const int movie_mode = !!is_movie_mode();
+    const int still_mode = !movie_mode;
+    const enum recording_state state = get_recording_state();
+
+    if (!lv || gui_menu_shown() || RECORDING_H264 || !event_q)
+        return 1; /* Leave unrelated Canon key handling unchanged. */
+
+    if (state == ACTIVE)
+    {
+        DryosDebugMsg(0, 15, "RPVIDX REC111 STOP still=%d", !!still_session_pending);
+        if (still_session_pending)
+            raw_vid_still_session_stop_once();
+        else if (!task_create("stop_com", WORKER_PRIO + 1, 0x800,
+                              send_stop_command, NULL))
+            DryosDebugMsg(0, 15, "RPVIDX REC111 STOP task failed");
+        return 0;
+    }
+    if (state != INACTIVE || still_session_pending || prevent_recording)
+    {
+        DryosDebugMsg(0, 15, "RPVIDX REC111 busy st=%d pending=%d blocked=%d",
+                      state, still_session_pending, prevent_recording);
+        return 0; /* Never forward a second REC to Canon mid-transition. */
+    }
+    if (still_mode && !raw_vid_still_mode_ok())
+    {
+        DryosDebugMsg(0, 15, "RPVIDX REC111 still guard lv=%d mode=%d",
+                      lv, shooting_mode);
+        return 1;
+    }
+
+    struct raw_vid_event *event = get_empty_event();
+    if (!event)
+    {
+        DryosDebugMsg(0, 15, "RPVIDX REC111 no free event");
+        return 0;
+    }
+    event->creation_time = get_ms_clock();
+    event->type = COMMAND_START;
+    event->still_session = still_mode;
+    event->requested_bpp = raw_vid_get_requested_bpp();
+    event->wire_le16 = 0;
+    event->resolution_mode = raw_vid_get_requested_resolution_mode();
+    event->codec_mode = raw_vid_get_requested_codec();
+    event->crx_frame_limit = raw_vid_get_requested_crx_frame_limit();
+    event->crx_latch_stop_mode = RAW_VID_CRX_LATCH_OFF;
+    event->crx_session_budget = 0;
+    event->crx_stillwatch = 0;
+    event->crx_allow_id0_still = 0;
+    event->x = event->y = event->w = event->h = 0;
+    const int codec = event->codec_mode;
+    const int bpp = event->requested_bpp;
+    const int res = event->resolution_mode;
+
+    if (still_mode)
+    {
+        still_session_pending = 1;
+        still_session_stop_sent = 0;
+        still_session_requested_ms = get_ms_clock();
+        still_session_active_ms = 0;
+        still_session_last_frame_ms = still_session_requested_ms;
+        still_session_frame_count = 0;
+        still_session_start_shootmode = shooting_mode;
+    }
+    const int rc = msg_queue_post(event_q, (uint32_t)event);
+    DryosDebugMsg(0, 15,
+                  "RPVIDX REC111 START rc=%d still=%d codec=%d bpp=%d res=%d",
+                  rc, still_mode, codec, bpp, res);
+    if (rc)
+    {
+        release_event(event);
+        if (still_mode) raw_vid_still_session_finish();
+    }
+    return 0;
+}
+
+/* The menu is an alternative control for photo modes where Canon does not
+ * forward GUI event 0x28. It waits for the menu to close before START. */
+static void raw_vid_record_menu_task(void *unused)
+{
+    (void)unused;
+    const uint32_t started = get_ms_clock();
+    while (gui_menu_shown() && get_ms_clock() - started < STILL_MENU_CLOSE_TIMEOUT_MS)
+        msleep(100);
+    if (!gui_menu_shown() && lv && !RECORDING_H264 &&
+        get_recording_state() == INACTIVE && !still_session_pending)
+        raw_vid_rp_rec_press();
+    else
+        DryosDebugMsg(0, 15, "RPVIDX REC111 menu canceled lv=%d mode=%d",
+                      lv, shooting_mode);
+    raw_record_menu_pending = 0;
+}
+
+void raw_vid_record_menu_toggle(void)
+{
+    if (get_recording_state() == ACTIVE)
+    {
+        if (still_session_pending)
+            raw_vid_still_session_stop_once();
+        else
+            raw_vid_request_stop_async();
+        return;
+    }
+    if (!lv || RECORDING_H264 || still_session_pending ||
+        raw_record_menu_pending || get_recording_state() != INACTIVE)
+        return;
+    raw_record_menu_pending = 1;
+    if (!task_create("rp_rec_menu", WORKER_PRIO + 1, 0x1000,
+                     raw_vid_record_menu_task, NULL))
+        raw_record_menu_pending = 0;
+}
+
+static unsigned int raw_vid_keypress_cbr_raw(unsigned int raw_event)
+{
+    struct event *event = (struct event *)raw_event;
+    if (!event)
+        return 1;
+
+    if ((uint32_t)event->param != RP_RAWVID_REC_PRESS)
+        return 1;
+
+    return raw_vid_rp_rec_press();
+}
+
+/*
+ * Legacy raw_vidx used CBR_VSYNC and raw_lv_redirect_edmac() here.
+ * EOS RP 1.6.0 has a separately proven frame-owner + true-Complete backend,
+ * so this RP-only build intentionally carries no legacy VSYNC capture path.
+ */
+
 MODULE_CBRS_START()
-    MODULE_CBR(CBR_VSYNC, raw_vid_vsync_cbr, 0)
-    MODULE_CBR(CBR_KEYPRESS, raw_vid_keypress_cbr, 0)
+    /* Use the unmodified GUI event on RP.  This bypasses incomplete portable
+     * key/movie-mode translation while capture timing still comes entirely
+     * from the EvfDevVram owner hook + hardware Complete tap. */
+    MODULE_CBR(CBR_KEYPRESS_RAW, raw_vid_keypress_cbr_raw, 0)
 MODULE_CBRS_END()
