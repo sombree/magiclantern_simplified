@@ -1211,7 +1211,8 @@ static int rp_alloc_frame_slots(uint32_t payload_size)
                    (int)(rp_frame_waste_bytes / 1024u));
     return 0;
 }
-static void alloc_crop_bufs(struct crop_buf crop_bufs[])
+
+static void alloc_crop_bufs(struct crop_buf crop_bufs[], int resolution_mode, int bpp)
 {
     if (crop_bufs[0]._buf != NULL
         || crop_bufs[1]._buf != NULL)
@@ -1220,11 +1221,47 @@ static void alloc_crop_bufs(struct crop_buf crop_bufs[])
         return;
     }
     
-    uint32_t buf_size = INITIAL_CROP_BUF_SIZE + CROP_BUF_ALIGN;
+    /* The original RP MVP used two fixed 8 MiB accumulation buffers.  That is
+     * enough through 2560x1440, but not for a complete 3728x2052 RAW frame
+     * (13.4 MiB at 14-bit).  Size the floor from the frozen output preset so
+     * every allocated buffer can hold at least one VIDF payload.
+     *
+     * Full uses the largest runtime-proven RP channel as the pre-RAW-LV hint;
+     * after raw_lv_request() the exact current channel is validated separately. */
+    uint32_t hint_w = 1280;
+    uint32_t hint_h = 720;
+    if (resolution_mode == RAW_VID_RES_1080P)
+    {
+        hint_w = 1920; hint_h = 1080;
+    }
+    else if (resolution_mode == RAW_VID_RES_1440P)
+    {
+        hint_w = 2560; hint_h = 1440;
+    }
+    else if (resolution_mode == RAW_VID_RES_FULL ||
+             resolution_mode == RAW_VID_RES_W3_TRANSPORT ||
+             resolution_mode == RAW_VID_RES_W3_WIDE_720)
+    {
+        hint_w = 3728; hint_h = 2052;
+    }
+
+    uint32_t min_usable_size = MIN_CROP_BUF_SIZE;
+    uint32_t initial_usable_size = INITIAL_CROP_BUF_SIZE;
+    if (is_camera("RP", "1.6.0"))
+    {
+        uint32_t payload_hint = hint_w * hint_h * (uint32_t)bpp / 8u;
+        uint32_t required = ALIGN_UP(payload_hint + CROP_BUF_ALIGN, CROP_BUF_STEP_SIZE);
+        min_usable_size = MAX((uint32_t)MIN_CROP_BUF_SIZE, required);
+        initial_usable_size = MAX(8u * 1024u * 1024u, min_usable_size);
+    }
+
+    uint32_t usable_size = initial_usable_size;
+    uint32_t buf_size = usable_size + CROP_BUF_ALIGN;
     char *buf0 = NULL;
     char *buf1 = NULL;
-    while (buf_size > MIN_CROP_BUF_SIZE)
+    while (usable_size >= min_usable_size)
     {
+        buf_size = usable_size + CROP_BUF_ALIGN;
         buf0 = fio_malloc(buf_size);
         if (buf0 != NULL)
         {
@@ -1240,10 +1277,12 @@ static void alloc_crop_bufs(struct crop_buf crop_bufs[])
             }
         }
 
-        buf_size -= CROP_BUF_STEP_SIZE;
+        if (usable_size < min_usable_size + CROP_BUF_STEP_SIZE)
+            break;
+        usable_size -= CROP_BUF_STEP_SIZE;
     }
 
-    if (buf_size < MIN_CROP_BUF_SIZE)
+    if (buf0 == NULL || buf1 == NULL)
     {
         SEND_LOG_DATA_STR("Couldn't find good crop bufs\n");
         // These should both already be null, but it's a big memory leak
@@ -1288,28 +1327,65 @@ static void alloc_crop_bufs(struct crop_buf crop_bufs[])
     // I'm assuming not, it's a small amount, and would rarely contain data
     // before we write out.
 
-    // We use these for DMA ops, which prefer / require
-    // the uncacheable address.
-    crop_bufs[0].start = UNCACHEABLE(crop_bufs[0].start);
-    crop_bufs[1].start = UNCACHEABLE(crop_bufs[1].start);
+    /*
+     * Legacy raw_vidx accumulated into DMA/uncached aliases.  RP stage 17
+     * deliberately uses cacheable CPU destinations: the source remains the
+     * DMA/uncached full-frame ring, while FIO_WriteFile() already performs
+     * cache clean and converts cacheable sources to UNCACHEABLE internally.
+     */
+    if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 17)
+    {
+        crop_bufs[0].start = CACHEABLE(crop_bufs[0].start);
+        crop_bufs[1].start = CACHEABLE(crop_bufs[1].start);
+    }
+    else
+    {
+        crop_bufs[0].start = UNCACHEABLE(crop_bufs[0].start);
+        crop_bufs[1].start = UNCACHEABLE(crop_bufs[1].start);
+    }
 
+    /* buf_size includes CROP_BUF_ALIGN bytes of alignment padding.  Starting
+     * from the aligned alias and adding the entire allocation size can run up
+     * to CROP_BUF_ALIGN-1 bytes past the allocation.  Keep a guaranteed-safe
+     * aligned payload size instead. */
+    /* usable_size was tracked separately from the allocation padding above. */
     crop_bufs[0].cur = crop_bufs[0].start;
-    crop_bufs[0].end = crop_bufs[0].start + buf_size;
+    crop_bufs[0].end = crop_bufs[0].start + usable_size;
     crop_bufs[1].cur = crop_bufs[1].start;
-    crop_bufs[1].end = crop_bufs[1].start + buf_size;
+    crop_bufs[1].end = crop_bufs[1].start + usable_size;
+    crop_bufs[0].writing = 0;
+    crop_bufs[1].writing = 0;
 }
 
-// Old DryOS used to trigger this, new DryOS
-// seems to only trigger the write complete cbr.
-static void edmac_cbr_r(void *unused_ctx)
+static void free_crop_bufs(struct crop_buf crop_bufs[])
 {
-}
+    /* Do not leave dirty cache lines referring to memory returned to Canon.
+     * sync_caches() is a core-internal symbol and is not exported to modules on
+     * RP.  dcache_clean() is an RP stub and is sufficient here because these
+     * buffers contain data, not executable code. */
+    if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 17)
+    {
+        for (int i = 0; i < 2; i++)
+        {
+            if (crop_bufs[i].start != NULL && crop_bufs[i].end > crop_bufs[i].start)
+            {
+                dcache_clean((uint32_t)CACHEABLE(crop_bufs[i].start),
+                             (uint32_t)(crop_bufs[i].end - crop_bufs[i].start));
+            }
+        }
+    }
 
-// Triggers when EDMAC write operation is complete.
-static void edmac_cbr_w(void *unused_ctx)
-{
-    edmac_copy_rectangle_adv_cleanup();
-    give_semaphore(edmac_sem); // signal edmac copy rect as safe to use
+    for (int i = 0; i < 2; i++)
+    {
+        if (crop_bufs[i]._buf != NULL)
+            fio_free(crop_bufs[i]._buf);
+
+        crop_bufs[i]._buf = NULL;
+        crop_bufs[i].start = NULL;
+        crop_bufs[i].cur = NULL;
+        crop_bufs[i].end = NULL;
+        crop_bufs[i].writing = 0;
+    }
 }
 
 static void write_buf_to_disk(struct crop_buf *crop_buf)
@@ -1331,47 +1407,158 @@ static void write_buf_to_disk(struct crop_buf *crop_buf)
         || crop_buf->end == NULL)
     {
         SEND_LOG_DATA_STR("ERROR: some buf member for disk write was NULL\n");
+        crop_buf->writing = 0;
         return;
     }
-    
-    // FIXME we probably want a sem to remove the potential
-    // for COMMAND_STOP to close this handle before we start
-    // the write.
+
+    /* COMMAND_STOP waits for writing to clear before closing raw_vid_fp. */
     if (raw_vid_fp == NULL)
     {
         SEND_LOG_DATA_STR("ERROR: raw_vid_fp was NULL before write\n");
+        crop_buf->writing = 0;
         return;
     }
 
     #ifdef RAW_VID_LOG
     uint32_t start_time = get_ms_clock();
     #endif
-    FIO_WriteFile(raw_vid_fp, crop_buf->start, crop_buf->cur - crop_buf->start);
+
+    /* S35: avoid launching the heavy storage transaction in the narrow
+     * pre-VD window implicated by the 4K Err70 traces. */
+    rp_wait_fio_safe_phase();
+
+    uint32_t fio_bytes = (uint32_t)(crop_buf->cur - crop_buf->start);
+    uint64_t fio_t0 = 0;
+    if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 36)
+    {
+        fio_t0 = (uint64_t)get_us_clock();
+        RP_START_TRACE("S36 FIO start bytes=%d prio=%x",
+                       (int)fio_bytes, WORKER_PRIO);
+    }
+
+    FIO_WriteFile(raw_vid_fp, crop_buf->start, fio_bytes);
+
+    if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 36)
+    {
+        uint32_t fio_us = (uint32_t)((uint64_t)get_us_clock() - fio_t0);
+        uint32_t rate_x10 = fio_us
+            ? (uint32_t)(((uint64_t)fio_bytes * 10u) / fio_us)
+            : 0;
+        if (fio_us > rp_writer_max_us)
+            rp_writer_max_us = fio_us;
+        RP_START_TRACE("S36 FIO done bytes=%d us=%d rate=%d.%dMBs",
+                       (int)fio_bytes, (int)fio_us,
+                       (int)(rate_x10 / 10u), (int)(rate_x10 % 10u));
+    }
+
     #ifdef RAW_VID_LOG
     uint32_t end_time = get_ms_clock();
-    uint32_t data_rate_x100 = (uint32_t)((float)(crop_buf->cur - crop_buf->start) / 1024 / 1024
+    uint32_t data_rate_x100 = (uint32_t)((float)fio_bytes / 1024 / 1024
                               * 1000 * 100 / (end_time - start_time));
-
-// FIXME this sometimes lags out and we stall.  I can think of two obvious things to try.
-// One: stop creating this func in a task every flush, keep it resident and use sems.
-// Two: use more buffers, this averages out the required write data rate.
-
     snprintf(log_buf, buf_size, "Buf flush data rate, MB/s: %d.%02d\n",
              data_rate_x100 / 100,
              data_rate_x100 % 100);
     send_log_data_str(log_buf);
     #endif
 
-    // reset buf so it's good to use again
+    /* Publish FREE last.  Producer uses cur==start as the reusable test and
+     * writing as stop/drain ownership, so reset data position before ownership. */
     crop_buf->cur = crop_buf->start;
+    crop_buf->writing = 0;
 }
 
-// This is the heart of worker.c.
-//
-// This runs as a task whenever the module is loaded,
-// regardless of whether a recording is in progress.
-//
-// It is the only consumer of the message queue. 
+static int rp_queue_crx_header_write(char *ptr, uint32_t size)
+{
+    if (rp_write_q == NULL || ptr == NULL || size == 0u)
+        return -1;
+    if (rp_header_write_pending || rp_header_write_done)
+        return -2;
+
+    rp_header_write_ptr = ptr;
+    rp_header_write_size = size;
+    rp_header_write_failed = 0;
+    rp_header_write_pending = 1;
+
+    int rc = msg_queue_post(
+        rp_write_q, (uint32_t)(uintptr_t)RP_WRITE_HEADER_TOKEN);
+    if (rc)
+    {
+        rp_header_write_pending = 0;
+        rp_header_write_ptr = NULL;
+        rp_header_write_size = 0;
+        return rc;
+    }
+
+    RP_START_TRACE("S36 REV2 HEADER queued bytes=%d", (int)size);
+    return 0;
+}
+
+static int rp_queue_frame_slot_write(struct rp_frame_slot *slot)
+{
+    if (!is_camera("RP", "1.6.0") || RP_START_PROBE_STAGE != 36)
+        return -100;
+    if (rp_write_q == NULL || slot == NULL)
+        return -1;
+
+    if (rp_slot_lock())
+        return -2;
+
+    if (slot->state != RP_FRAME_SLOT_CAPTURING || slot->used == 0u)
+    {
+        rp_slot_unlock();
+        return -3;
+    }
+
+    slot->state = RP_FRAME_SLOT_FULL;
+    rp_writer_jobs_queued++;
+    /* Rolling ingress in decimal MB/s x 100, measured on serialized VIDFs,
+     * never on uncompressed source bytes. No disk work in producer context. */
+    uint32_t now_us = get_us_clock();
+    if (!rp_ingress_window_t0) rp_ingress_window_t0 = now_us;
+    rp_ingress_window_bytes += slot->used;
+    if (!rp_writer_recent_frame_bytes)
+        rp_writer_recent_frame_bytes = slot->used;
+    else
+        rp_writer_recent_frame_bytes =
+            (uint32_t)(((uint64_t)rp_writer_recent_frame_bytes * 7u +
+                        slot->used) / 8u);
+    uint32_t window_us = now_us - rp_ingress_window_t0;
+    if (window_us >= 500000u)
+    {
+        rp_writer_ingress_rate_x100 =
+            (uint32_t)((rp_ingress_window_bytes * 100u) / window_us);
+        rp_ingress_window_bytes = 0;
+        rp_ingress_window_t0 = now_us;
+    }
+    rp_slot_unlock();
+
+    int rc = msg_queue_post(rp_write_q, (uint32_t)(uintptr_t)slot);
+    if (rc)
+    {
+        if (!rp_slot_lock())
+        {
+            rp_writer_jobs_queued--;
+            slot->state = RP_FRAME_SLOT_CAPTURING;
+            rp_slot_unlock();
+        }
+        rp_writer_post_fail++;
+        RP_START_TRACE("S36 SLOT enqueue FAIL rc=%d frame=%d bytes=%d",
+                       rc, (int)slot->frame_number, (int)slot->used);
+        return rc;
+    }
+
+    uint32_t qdepth = 0;
+    msg_queue_count(rp_write_q, &qdepth);
+    uint32_t free_count = rp_count_free_frame_slots();
+    if (free_count < rp_slot_min_free)
+        rp_slot_min_free = free_count;
+
+    RP_START_TRACE("S36 SLOT enqueue job=%d q=%d frame=%d bytes=%d free=%d reserved=%d",
+                   (int)rp_writer_jobs_queued, (int)qdepth,
+                   (int)slot->frame_number, (int)slot->used,
+                   (int)free_count, (int)rp_count_reserved_frame_slots());
+    return 0;
+}
 static void worker(void)
 {
     #ifdef RAW_VID_LOG
