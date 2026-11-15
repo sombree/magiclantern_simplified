@@ -1186,3 +1186,314 @@ static int rp_crx_v22_wait_post_free(uint32_t target)
     }
     return 0;
 }
+
+static uint32_t rp_crx_state_probe_cb(uint32_t a0, uint32_t a1,
+                                      uint32_t a2, uint32_t a3, uint32_t a4)
+{
+    uint32_t state = g_state_probe_state;
+    uint32_t orig = g_state_probe_orig_cb;
+
+    g_state_probe_a0 = a0;
+    g_state_probe_a1 = a1;
+    g_state_probe_a2 = a2;
+    g_state_probe_a3 = a3;
+    g_state_probe_a4 = a4;
+    g_state_probe_hits++;
+
+    /* One-shot self-unhook before entering Canon.  E058F910 ABI is the
+     * DryOS state-object transition ABI:
+     *   a0 = state object, a1 = event x/owner, a2 = input/event number,
+     *   a3 = event payload, a4 = payload size.
+     * Restore the generic transition callback before doing any inspection so
+     * an assert/early return cannot leave our wrapper installed. */
+    if (state != 0u && a0 == state && orig != 0u)
+    {
+        volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)state;
+        if (st[3] == (uint32_t)(uintptr_t)&rp_crx_state_probe_cb)
+            st[3] = orig;
+    }
+    g_state_probe_armed = 0u;
+    rp_crx_barrier();
+
+    /* Passive proof that event 2 is our synthetic StartEncode job.  Public
+     * E0651986 posts (manager, 2, job, 0x70).  The job owns a copied 0x2c
+     * descriptor array at job[2], and job[5] is the active descriptor index. */
+    if (a2 == 2u && a3 >= 0x1000u && a3 < 0xE0000000u &&
+        (a3 & 3u) == 0u && a4 == 0x70u)
+    {
+        volatile uint32_t *job = (volatile uint32_t *)(uintptr_t)a3;
+        uint32_t idx = job[5];
+        uint32_t desc_base = job[2];
+        if (idx < 4u && desc_base >= 0x1000u && desc_base < 0xE0000000u &&
+            (desc_base & 3u) == 0u)
+        {
+            volatile uint32_t *d =
+                (volatile uint32_t *)(uintptr_t)(desc_base + idx * 0x2cu);
+            g_state_probe_job_type = d[0];
+            g_state_probe_job_bits = d[5];
+            g_state_probe_job_src = d[6];
+            if (d[0] == g_state_probe_req_type &&
+                d[5] == g_state_probe_req_bits &&
+                d[6] == g_state_probe_req_src)
+                g_state_probe_matches++;
+            else
+                g_state_probe_mismatches++;
+        }
+        else
+        {
+            g_state_probe_mismatches++;
+        }
+    }
+    else
+    {
+        g_state_probe_mismatches++;
+    }
+    rp_crx_barrier();
+
+    if (orig == 0u)
+        return 7u;
+
+    return ((rp_crx_state_cb_fn)(uintptr_t)orig)(a0, a1, a2, a3, a4);
+}
+
+static int rp_crx_arm_state_probe(uint32_t type, uint32_t bits, uint32_t src)
+{
+    uint32_t manager = *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    if (manager < 0x1000u || manager >= 0xE0000000u || (manager & 3u))
+        return -40;
+
+    uint32_t state = *(volatile uint32_t *)(uintptr_t)
+        (manager + 0x0cu);
+    if (state < 0x1000u || state >= 0xE0000000u || (state & 3u))
+        return -41;
+
+    volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)state;
+    uint32_t orig = st[3];
+    uint32_t hook = (uint32_t)(uintptr_t)&rp_crx_state_probe_cb;
+    if (orig == 0u || orig == hook)
+        return -42;
+
+    /* Refuse to overwrite an earlier unresolved probe. */
+    if (g_state_probe_armed)
+        return -43;
+
+    g_state_probe_req_type = type;
+    g_state_probe_req_bits = bits;
+    g_state_probe_req_src = src;
+    g_state_probe_state = state;
+    g_state_probe_orig_cb = orig;
+    g_state_probe_a0 = 0u;
+    g_state_probe_a1 = 0u;
+    g_state_probe_a2 = 0u;
+    g_state_probe_a3 = 0u;
+    g_state_probe_a4 = 0u;
+    g_state_probe_job_type = 0xffffffffu;
+    g_state_probe_job_bits = 0u;
+    g_state_probe_job_src = 0u;
+    g_state_probe_armed = 1u;
+    rp_crx_barrier();
+
+    st[3] = hook;
+    rp_crx_barrier();
+    if (st[3] != hook)
+    {
+        g_state_probe_armed = 0u;
+        rp_crx_barrier();
+        return -44;
+    }
+
+    RP_CRX_TRACE("STATEPROBE arm mgr=%x state=%x cb=%x hook=%x",
+                 manager, state, orig, hook);
+    return 0;
+}
+
+/* Called by Canon AlgsMgr completion context through BLX.  Keep this bounded
+ * RAM-only: no logging, allocation, waits, semaphores, FIO or M2M. */
+static void rp_crx_free_complete_cb(uint32_t opaque, uint32_t status)
+{
+    (void)opaque;
+    if (status != 0u)
+        g_free_callback_errors++;
+    if (g_free_pending != 0u)
+        g_free_pending--;
+    g_free_completed++;
+    rp_crx_barrier();
+}
+
+static void rp_crx_complete_cb(uint32_t opaque, uint32_t *handles, uint32_t count)
+{
+    if (!g_active || opaque != g_active_token)
+    {
+        g_stats.unexpected_callbacks++;
+        rp_crx_barrier();
+        return;
+    }
+
+    uint32_t n = count;
+    if (n > RP_CRX_RESULT_MAX)
+        n = RP_CRX_RESULT_MAX;
+
+    g_callback_token = opaque;
+    g_callback_count = count;
+    for (uint32_t i = 0; i < RP_CRX_RESULT_MAX; i++)
+        g_callback_handles[i] = (handles && i < n) ? handles[i] : 0u;
+
+    rp_crx_barrier();
+    g_done = 1;
+    rp_crx_barrier();
+#if RP_CRX_EVENT_WAIT
+    /* DryOS declares give_semaphore IRQ-safe on RP. No blocking, allocation
+     * or log work is performed in Canon's completion context. */
+    if (g_completion_sem)
+        (void)give_semaphore(g_completion_sem);
+#endif
+}
+
+int raw_vid_rp_crx_preflight_mode(uint32_t requested_bits, int lossy)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return -1;
+    if (g_active)
+        return -2;
+    if (g_poisoned)
+        return -3;
+    if (requested_bits != 10u && requested_bits != 12u && requested_bits != 14u)
+        return -4;
+    if (g_free_pending != 0u)
+        return -6;
+
+    /* v23.2 production policy is dynamic-only.  There is no fixed-route /
+     * persistent-bank fallback: every CRX/C-RAW session must start on the
+     * first compatible latch-0 D-slot and must later prove an exact tail that
+     * can be reclaimed. */
+    rp_crx_barrier();
+
+    uint32_t manager =
+        *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    if (g_state_probe_armed)
+        return -81;
+    if (!rp_crx_ram_ptr(manager))
+        return -82;
+
+    uint32_t type = 0u;
+    uint32_t enc_id = 0u;
+    if (rp_crx_v22_pick_free_route(manager, requested_bits, lossy,
+                                   &type, &enc_id) != 0)
+        return -83;
+
+    struct rp_crx_bank_snapshot s;
+    if (rp_crx_bank_snapshot(manager, enc_id, &s) != 0 ||
+        !rp_crx_snapshot_arena_valid(&s) ||
+        s.mode != RP_CRX_MODE_LOSSLESS ||
+        s.latch != 0u || s.hw_active != 0u)
+        return -84;
+
+    /* The selected slot must be software-free too.  Stale workspace pointer
+     * fields are allowed because Canon reinitializes them when latch==0. */
+    if (g_encoder_bank_bits[enc_id] != 0u)
+        return -85;
+
+    g_route_valid = 1u;
+    g_route_bits = requested_bits;
+    g_route_lossy = lossy ? 1u : 0u;
+    g_route_type = type;
+    g_route_id = enc_id;
+    g_reclaim_candidate_valid = 0u;
+    g_stats.reclaim_route_type = type;
+    g_stats.reclaim_route_id = enc_id;
+    g_bank_first_width[enc_id] = 0u;
+    g_bank_first_height[enc_id] = 0u;
+
+    RP_CRX_TRACE("V23.2 PREFLIGHT dynamic bits=%d lossy=%d route=%d/%d cur=%x",
+                 (int)requested_bits, lossy ? 1 : 0,
+                 (int)type, (int)enc_id, s.cursor);
+    return 0;
+}
+
+int raw_vid_rp_crx_preflight(uint32_t requested_bits)
+{
+    return raw_vid_rp_crx_preflight_mode(requested_bits, 0);
+}
+
+int raw_vid_rp_crx_begin_session_mode(int lossy)
+{
+    if (!is_camera("RP", "1.6.0"))
+        return -1;
+    if (g_active)
+        return -2;
+    if (g_poisoned)
+        return -3;
+    if (g_free_pending != 0u)
+        return -4;
+
+    /* Historical one-shot retry/multi-clear experiments are not part of the
+     * v23.2 recorder lifecycle and cannot consume or veto a normal session. */
+
+    uint32_t manager =
+        *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    if (manager < 0x1000u || manager >= 0xE0000000u || (manager & 3u))
+        return -8;
+
+    g_session_manager = manager;
+    g_session_manager_mode = *(volatile uint32_t *)(uintptr_t)
+        (manager + RP_CRX_ALGSMGR_MODE_OFFSET);
+    g_session_lossy = lossy ? 1u : 0u;
+    g_session_bits = 0u;
+    g_session_first_hw_latch = 0xffffffffu;
+    g_session_first_sw_bits = 0xffffffffu;
+    g_session_encode_attempts = 0u;
+    g_session_good_encodes = 0u;
+    g_session_clean_end = 0u;
+    memset(&g_tail_audit, 0, sizeof(g_tail_audit));
+    g_tail_audit.enabled = 0u;
+    g_v19_active = 0u;
+    g_v19_pre_valid = 0u;
+    g_v19_between_changed = 0u;
+    g_v19_epoch_suspect = 0u;
+    g_session_multi_bits = 0u;
+    g_reclaim_requested = 0u;
+    g_reclaim_in_progress = 0u;
+    g_reclaim_attempted = 0u;
+    g_reclaim_last_rc = 0;
+    g_reclaim_last_path = 0u;
+    g_reclaim_write_started = 0u;
+    g_reclaim_candidate_valid = 0u;
+    g_free_post_completed = 0u;
+    g_first_encode_before_valid = 0u;
+    /* Always reset per-session allocation observations.  Old retry/multi
+     * globals are intentionally ignored by the production recorder. */
+    g_first_alloc_valid = 0u;
+    g_first_alloc_bytes = 0u;
+    g_first_init_after_valid = 0u;
+    g_last_good_width = 0u;
+    g_last_good_height = 0u;
+    memset(&g_stats, 0, sizeof(g_stats));
+    g_free_completed = 0;
+    g_free_callback_errors = 0;
+    g_done = 0;
+    g_callback_token = 0;
+    g_callback_count = 0;
+    for (uint32_t i = 0; i < RP_CRX_RESULT_MAX; i++)
+        g_callback_handles[i] = 0;
+    if (!g_route_valid || g_route_lossy != (uint32_t)(lossy ? 1 : 0))
+        return -11;
+#if RP_CRX_EVENT_WAIT
+    if (!g_completion_sem)
+    {
+        g_completion_sem = create_named_semaphore("rp_crx_done", SEM_CREATE_LOCKED);
+        if (!g_completion_sem)
+            RP_CRX_TRACE("EVENT semaphore unavailable, using poll fallback");
+    }
+#endif
+    int wrc = rp_crx_v22_install_state_wrapper();
+    if (wrc)
+        return wrc;
+    RP_CRX_TRACE("V23.2 WRAP install route=%d/%d state=%x orig=%x",
+                 (int)g_route_type,(int)g_route_id,
+                 g_session_state,g_session_state_orig_cb);
+
+    RP_CRX_TRACE("SESSION begin lossy=%d mgr=%x mode_before=%x",
+                 (int)g_session_lossy, manager, g_session_manager_mode);
+    rp_crx_barrier();
+    return 0;
+}
