@@ -290,3 +290,226 @@ static void w3m_snapshot_text(const char *label,
       (int)s->bad_complete,(int)s->post_fail,(int)s->fatal);
     w3m_text(b);
 }
+
+/* Register differences from ALREADY CAPTURED task-context snapshots.
+ * This performs no new MMIO accesses or IRQ logging. PU24 changed bits are
+ * not interpreted as functionality without an accompanying pixel analysis. */
+static void w3m_delta_text(const char *name,
+                          const struct rp_w3_hw_snapshot *a,
+                          const struct rp_w3_hw_snapshot *b)
+{
+    char line[320];
+    snprintf(line,sizeof(line),
+        "REGDELTA %s pu20=%08x pu24=%08x pu28=%08x "
+        "w350=%08x w3a0=%08x w3d0=%08x "
+        "cfg=%08x,%08x,%08x,%08x,%08x\n",
+        name,
+        (int)(a->pu20^b->pu20),(int)(a->pu24^b->pu24),
+        (int)(a->pu28^b->pu28),(int)(a->w350^b->w350),
+        (int)(a->w3a0^b->w3a0),(int)(a->w3d0^b->w3d0),
+        (int)(a->cfg[0]^b->cfg[0]),(int)(a->cfg[1]^b->cfg[1]),
+        (int)(a->cfg[2]^b->cfg[2]),(int)(a->cfg[3]^b->cfg[3]),
+        (int)(a->cfg[4]^b->cfg[4]));
+    w3m_text(line);
+}
+
+int rp_w3_matrix_running(void) { return g_running != 0; }
+int rp_w3_matrix_interlocked(void) { return g_interlock != 0; }
+int rp_w3_matrix_case_active(void) { return g_running && g_index >= 0; }
+int rp_w3_matrix_requires_linear(void)
+{
+    return rp_w3_matrix_case_active() ? w3m_cases[g_index].linear : 0;
+}
+int rp_w3_matrix_field_index(void)
+{
+    return rp_w3_matrix_case_active() ? w3m_cases[g_index].field : -1;
+}
+int rp_w3_matrix_field_value(void)
+{
+    return rp_w3_matrix_case_active() ? w3m_cases[g_index].value : -1;
+}
+void rp_w3_matrix_abort_user(void)
+{
+    if (g_running)
+    {
+        g_abort = 1;
+        W3M_LOG("USER ABORT requested");
+    }
+}
+const char *rp_w3_matrix_video_pattern(void)
+{
+    return g_single_case >= 0 ? "ws%02d.mlv" :
+           g_pair_only ? "wp%02d.mlv" :
+           g_no_restart ? "wa%02d.mlv" : "wm%02d.mlv";
+}
+void rp_w3_matrix_file(const char *name)
+{
+    if (!rp_w3_matrix_case_active()) return;
+    snprintf(g_video_name, sizeof(g_video_name), "%s", name ? name : "");
+    W3M_LOG("VIDEO case=%s file=%s", w3m_cases[g_index].id, g_video_name);
+}
+void rp_w3_matrix_capture_pre(void)
+{
+    if (rp_w3_matrix_case_active()) raw_vid_rp_matrix_snapshot(&g_pre);
+}
+void rp_w3_matrix_apply_result(int rc)
+{
+    if (!rp_w3_matrix_case_active()) return;
+    g_apply_rc = rc;
+    raw_vid_rp_matrix_snapshot(&g_applied);
+    /* The source sample BPP and the W3 wire container width are distinct.
+     * This is informational: NO descriptor change is performed here. */
+    struct rp_w3_transport_plan p;
+    int plan_rc = raw_vid_rp_transport_get_plan(&p);
+    g_wireplan_valid = plan_rc == 0;
+    if (g_wireplan_valid) g_wireplan = p;
+    if (!plan_rc)
+    {
+        W3M_LOG("WIREPLAN case=%s sample=%d wire=%d nominal=%d/%d target=%d/%d seen_pitch=%d hw_ready=%d",
+                w3m_cases[g_index].id,(int)p.sample_bpp,(int)p.wire_bpp,
+                (int)p.nominal_pitch,(int)p.nominal_bytes,
+                (int)p.target_pitch,(int)p.target_bytes,
+                (int)p.observed_pitch,(int)p.hw_full_width);
+    }
+    else W3M_LOG("WIREPLAN FAIL case=%s rc=%d",w3m_cases[g_index].id,plan_rc);
+    W3M_LOG("APPLIED id=%s rc=%d pu=%x cfg=%x,%x,%x,%x,%x",
+       w3m_cases[g_index].id,rc,(int)g_applied.pu24,
+       (int)g_applied.cfg[0],(int)g_applied.cfg[1],(int)g_applied.cfg[2],
+       (int)g_applied.cfg[3],(int)g_applied.cfg[4]);
+}
+void rp_w3_matrix_on_arm(void)
+{
+    if (rp_w3_matrix_case_active())
+    {
+        raw_vid_rp_matrix_snapshot(&g_armed);
+        struct rp_w3_transport_plan p;
+        int plan_rc = raw_vid_rp_transport_get_plan(&p);
+        if (!plan_rc)
+        {
+            g_wireplan = p;
+            g_wireplan_valid = 1;
+            W3M_LOG("WIREPLAN_ARM sample=%d wire=%d src_cap=%d target=%d hw_full=%d alloc_full=%d",
+                    (int)p.sample_bpp,(int)p.wire_bpp,(int)p.source_capacity,
+                    (int)p.target_bytes,(int)p.hw_full_width,(int)p.buffer_full_width);
+        }
+        /* Historical ARM line is retained for baseline log parsers. */
+        W3M_LOG("ARM_BASE id=%s pu=%x pitch=%d",w3m_cases[g_index].id,
+                (int)g_armed.pu24, (int)(g_armed.w350 & 0xffffu));
+    }
+}
+void rp_w3_matrix_capture_end(void)
+{
+    if (!rp_w3_matrix_case_active()) return;
+    raw_vid_rp_matrix_snapshot(&g_during_end);
+    W3M_LOG("END_BEFORE_RESTORE case=%s PU24=%x owner=%d complete=%d",
+       w3m_cases[g_index].id,(int)g_during_end.pu24,
+       (int)g_during_end.owner,(int)g_during_end.complete);
+}
+void rp_w3_matrix_on_frame(uint32_t frame, int slot, uint32_t us)
+{
+    if (!rp_w3_matrix_case_active()) return;
+    if (g_frames < W3M_MAX_FRAMES)
+    {
+        g_meta[g_frames].frame=frame;
+        g_meta[g_frames].slot=slot;
+        g_meta[g_frames].us=us;
+        raw_vid_rp_matrix_counts(&g_meta[g_frames].owner,
+                                  &g_meta[g_frames].complete);
+    }
+    g_frames=frame;
+}
+void rp_w3_matrix_restore_result(int rc)
+{
+    if (!rp_w3_matrix_case_active()) return;
+    g_restore_rc = rc;
+    raw_vid_rp_matrix_snapshot(&g_restored);
+    W3M_LOG("RESTORE id=%s rc=%d",w3m_cases[g_index].id,rc);
+}
+void rp_w3_matrix_pre_cleanup(int stop_rc,int drain_rc,int frames,
+                              int io_fail,int post_fail)
+{
+    if (!rp_w3_matrix_case_active()) return;
+    raw_vid_rp_matrix_snapshot(&g_before_off);
+    g_stop_transfer_rc=stop_rc;
+    g_stop_drain_rc=drain_rc;
+    g_stop_frame_count=frames;
+    g_writer_io=io_fail;
+    g_writer_post=post_fail;
+}
+void rp_w3_matrix_storage_status(int io_fail,int post_fail)
+{
+    if (!rp_w3_matrix_case_active()) return;
+    g_writer_io=io_fail;g_writer_post=post_fail;
+}
+
+void rp_w3_matrix_on_stop(int cleanup_rc,int stop_rc,int drain_rc)
+{
+    if (!rp_w3_matrix_case_active()) return;
+    g_stop_clean=cleanup_rc;
+    g_stop_transfer_rc=stop_rc;
+    g_stop_drain_rc=drain_rc;
+    W3M_LOG("STOP id=%s frames=%d clean=%d stop=%d drain=%d drop=%d fatal=%d",
+      w3m_cases[g_index].id,g_stop_frame_count,cleanup_rc,stop_rc,drain_rc,
+      (int)g_before_off.drops,(int)g_before_off.fatal);
+}
+
+static int w3m_case_ok(void)
+{
+    if (g_apply_rc || g_restore_rc || g_stop_clean || g_stop_transfer_rc ||
+        g_stop_drain_rc || g_writer_io || g_writer_post ||
+        g_stop_frame_count < 2 || g_before_off.drops ||
+        g_before_off.overlap || g_before_off.bad_complete ||
+        g_before_off.post_fail || g_before_off.fatal)
+        return 0;
+    if (g_applied.mem1_state == 0u || g_armed.mem1_state == 0u ||
+        g_pre.mem1_state != g_applied.mem1_state ||
+        g_before_off.cb != 0xE037951Du || g_before_off.cb_arg != 0u ||
+        g_armed.w3a0 == 0u ||
+        g_during_end.w3a0 == 0u ||
+        g_restored.mem1_state != g_pre.mem1_state)
+        return 0;
+    const struct w3m_case *c=&w3m_cases[g_index];
+    /* Mode follows the selected BPP and linear packing. Do not impose RAW14
+     * / PIXBLOCK checks on 12/10-bit and LE serializations. */
+    const uint32_t expected_mode = c->bpp == 14 ? 2u :
+                                   c->bpp == 12 ? 1u : 0u;
+    if (c->bpp == 14)
+    {
+        if ((g_during_end.cfg[2] & 0xffu) != 2u &&
+            (g_during_end.cfg[2] & 0xffu) != 3u) return 0;
+    }
+    else if ((g_during_end.cfg[2] & 0xffu) != expected_mode) return 0;
+    if ((g_during_end.cfg[3] & 0xffu) != (uint32_t)c->linear)
+        return 0;
+    for (int i=0;i<5;++i)
+    {
+        /* The apply routine must change ONE logical field's low byte only. */
+        if ((g_applied.cfg[i] & ~0xffu) != (g_pre.cfg[i] & ~0xffu))
+            return 0;
+        if (i == c->field)
+        {
+            if ((g_applied.cfg[i] & 0xffu) != (uint32_t)c->value)
+                return 0;
+        }
+        else if (g_applied.cfg[i] != g_pre.cfg[i])
+            return 0;
+    }
+    /* Restore is observed before RAW-LV release, after Canon BPP/serializer
+     * restore. Ensure native RAW14 + PIXBLOCK are back, not still experimental. */
+    if (((g_restored.cfg[2] & 0xffu) != 2u &&
+         (g_restored.cfg[2] & 0xffu) != 3u) ||
+        (g_restored.cfg[3] & 0xffu) != 0u)
+        return 0;
+    if (!g_restored.mem1_state ||
+        g_restored.cfg[0] != g_pre.cfg[0] ||
+        g_restored.cfg[1] != g_pre.cfg[1] ||
+        g_restored.cfg[4] != g_pre.cfg[4])
+        return 0;
+    /* Before restoration the Canon task should still have the tested values;
+     * these checks use END_BEFORE_RESTORE, not LAST_BEFORE_RAW_OFF. */
+    if (g_during_end.cfg[0] != g_applied.cfg[0] ||
+        g_during_end.cfg[1] != g_applied.cfg[1] ||
+        g_during_end.cfg[4] != g_applied.cfg[4])
+        return 0;
+    return 1;
+}
