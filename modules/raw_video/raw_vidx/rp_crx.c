@@ -603,3 +603,303 @@ static int rp_crx_v19_read_bank(uint32_t mgr, uint32_t id,
     { out->valid=0u; return -6; }
     return 0;
 }
+
+/* Main worker task only; 22-bank snapshots are statically allocated to
+ * avoid large stack frames and preserve previous STOP across sessions. */
+static void rp_crx_v19_map(const char *phase, uint32_t own_id,
+                           struct rp_crx_v19_range *dest,
+                           uint32_t *unknown_out, uint32_t *active_out)
+{
+    uint32_t mgr=*(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    struct rp_crx_bank_snapshot root;
+    uint32_t unknown=0u, active=0u, empty=0u;
+    if (!rp_crx_ram_ptr(mgr) ||
+        rp_crx_bank_snapshot(mgr, own_id, &root) ||
+        !rp_crx_snapshot_arena_valid(&root) ||
+        root.mode != RP_CRX_MODE_LOSSLESS)
+    {
+        RP_CRX_TRACE("V19 badmap p=%s s=%d mgr=%x", phase,
+                     (int)g_v19_session,mgr);
+        memset(dest,0,RP_CRX_ALGSMGR_LATCH_COUNT*sizeof(*dest));
+        if (unknown_out) *unknown_out=RP_CRX_ALGSMGR_LATCH_COUNT;
+        if (active_out) *active_out=0u;
+        return;
+    }
+    RP_CRX_TRACE("V19 root p=%s s=%d mgr=%x bk=%x mode=%x",
+                 phase,(int)g_v19_session,mgr,root.backend,root.mode);
+    RP_CRX_TRACE("V19 cur p=%s s=%d base=%x cur=%x",
+                 phase,(int)g_v19_session,root.arena_base,root.cursor);
+    for (unsigned i=0;i<RP_CRX_ALGSMGR_LATCH_COUNT;i++)
+    {
+        int rc=rp_crx_v19_read_bank(mgr,i,&root,&dest[i]);
+        struct rp_crx_v19_range *r=&dest[i];
+        if (rc || !r->valid)
+        {
+            unknown++;
+            RP_CRX_TRACE("V19 bad p=%s id=%d rc=%d l=%x p0=%x",
+                         phase,(int)i,rc,r->latch,r->p0);
+            continue;
+        }
+        if (!r->present) { empty++; continue; }
+        active++;
+        RP_CRX_TRACE("V19 cfg p=%s id=%d l=%d hw=%d n=%d k=%d opt=%d",
+                     phase,(int)i,(int)r->latch,
+                     (int)r->hw,(int)r->n,(int)r->k,(int)r->opt);
+        RP_CRX_TRACE("V19 span p=%s id=%d a=%x b=%x",
+                     phase,(int)i,r->lo,r->hi);
+    }
+    RP_CRX_TRACE("V19 map p=%s s=%d act=%d nil=%d bad=%d",
+                 phase,(int)g_v19_session,(int)active,(int)empty,(int)unknown);
+    if (unknown_out) *unknown_out=unknown;
+    if (active_out) *active_out=active;
+}
+
+static void rp_crx_v19_pre(uint32_t id)
+{
+    if (!g_v19_active || id >= RP_CRX_ALGSMGR_LATCH_COUNT) return;
+    uint32_t bad=0;
+    rp_crx_v19_map("PRE",id,g_v19_pre,&bad,0);
+    uint32_t mgr=*(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    struct rp_crx_bank_snapshot s;
+    g_v19_pre_valid=0;
+    if (bad || rp_crx_bank_snapshot(mgr,id,&s) ||
+        !rp_crx_snapshot_arena_valid(&s))
+    {
+        g_v19_epoch_suspect=1;
+        RP_CRX_TRACE("V19 pre_bad s=%d bad=%d",(int)g_v19_session,(int)bad);
+        return;
+    }
+    g_v19_pre_valid=1;
+    g_v19_pre_mgr=mgr; g_v19_pre_backend=s.backend;
+    g_v19_pre_mode=s.mode; g_v19_pre_cursor=s.cursor;
+    if (g_v19_prev_valid)
+    {
+        if (mgr!=g_v19_prev_mgr || s.backend!=g_v19_prev_backend ||
+            s.mode!=g_v19_prev_mode || s.arena_base!=g_v19_prev_base ||
+            s.cursor<g_v19_prev_cursor)
+            g_v19_epoch_suspect=1;
+        RP_CRX_TRACE("V19 between s=%d old=%x now=%x suspect=%d",
+                     (int)g_v19_session,g_v19_prev_cursor,s.cursor,(int)g_v19_epoch_suspect);
+        for (unsigned i=0;i<RP_CRX_ALGSMGR_LATCH_COUNT;i++)
+        {
+            const struct rp_crx_v19_range *a=&g_v19_prev[i],*b=&g_v19_pre[i];
+            if (a->present!=b->present || a->valid!=b->valid ||
+                a->lo!=b->lo || a->hi!=b->hi || a->latch!=b->latch ||
+                a->hw!=b->hw)
+            {
+                g_v19_between_changed++;
+                RP_CRX_TRACE("V19 diff id=%d a=%x-%x b=%x-%x",
+                             (int)i,a->lo,a->hi,b->lo,b->hi);
+            }
+        }
+        if (s.cursor!=g_v19_prev_cursor && !g_v19_between_changed)
+            RP_CRX_TRACE("V19 between_unknown: cursor moved, ranges unchanged");
+    }
+}
+
+static void rp_crx_v19_post(uint32_t id)
+{
+    if (!g_v19_active || id >= RP_CRX_ALGSMGR_LATCH_COUNT) return;
+    struct rp_crx_bank_snapshot s;
+    uint32_t mgr=*(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    if (!rp_crx_bank_snapshot(mgr,id,&s) &&
+        rp_crx_snapshot_arena_valid(&s))
+        RP_CRX_TRACE("V19 post s=%d id=%d old=%x now=%x",
+                     (int)g_v19_session,(int)id,g_v19_pre_cursor,s.cursor);
+    else RP_CRX_TRACE("V19 post_bad s=%d id=%d",(int)g_v19_session,(int)id);
+}
+
+static void rp_crx_v19_stop(int clean_stop)
+{
+    if (!g_v19_active) return;
+    g_v19_active=0u;
+    uint32_t id=g_tail_audit.id;
+    if (id>=RP_CRX_ALGSMGR_LATCH_COUNT) id=RP_CRX_ENCODER_ID_12BIT;
+    static struct rp_crx_v19_range stop_map[RP_CRX_ALGSMGR_LATCH_COUNT];
+    uint32_t bad=0u, active=0u, hits=0u;
+    rp_crx_v19_map("STOP",id,stop_map,&bad,&active);
+    uint32_t a=g_tail_audit.before.cursor,b=g_tail_audit.after.cursor;
+    if (!g_tail_audit.before_valid || !g_tail_audit.after_valid ||
+        !g_v19_pre_valid || b<a || !clean_stop || bad ||
+        g_v19_epoch_suspect)
+    {
+        RP_CRX_TRACE("V19 stop_bad s=%d clean=%d pre=%d a=%d b=%d bad=%d ep=%d",
+                     (int)g_v19_session,clean_stop,(int)g_v19_pre_valid,
+                     (int)g_tail_audit.before_valid,(int)g_tail_audit.after_valid,
+                     (int)bad,(int)g_v19_epoch_suspect);
+    }
+    else
+    {
+        uint32_t now_mgr=*(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+        struct rp_crx_bank_snapshot now;
+        const struct rp_crx_bank_snapshot *before=&g_tail_audit.before;
+        const struct rp_crx_bank_snapshot *after=&g_tail_audit.after;
+        if (now_mgr!=g_v19_pre_mgr ||
+            rp_crx_bank_snapshot(now_mgr,id,&now) ||
+            !rp_crx_snapshot_arena_valid(&now) ||
+            now.cursor!=b || now.backend!=g_v19_pre_backend ||
+            now.backend!=before->backend || now.backend!=after->backend ||
+            now.arena_base!=before->arena_base ||
+            now.arena_base!=after->arena_base ||
+            now.mode!=RP_CRX_MODE_LOSSLESS ||
+            now.hw_active!=0u || now.latch!=1u ||
+            !g_session_clean_end || g_session_good_encodes!=1u ||
+            g_active || g_free_pending || g_poisoned)
+        {
+            RP_CRX_TRACE("V19 stop_bad roots/leases s=%d",
+                         (int)g_v19_session);
+        }
+        else if (b==a)
+            RP_CRX_TRACE("V19 reuse s=%d id=%d cur=%x",
+                         (int)g_v19_session,(int)id,b);
+        else
+        {
+        for (unsigned i=0;i<RP_CRX_ALGSMGR_LATCH_COUNT;i++)
+        {
+            const struct rp_crx_v19_range *r=&stop_map[i];
+            if (i==id || !r->present || !r->valid) continue;
+            if (r->lo < b && a < r->hi)
+            {
+                hits++;
+                RP_CRX_TRACE("V19 overlap id=%d lo=%x hi=%x",
+                             (int)i,r->lo,r->hi);
+            }
+        }
+        RP_CRX_TRACE("V19 stop %s s=%d id=%d hits=%d",
+                     hits ? "BLOCK" : "UNPROVEN",
+                     (int)g_v19_session,(int)id,(int)hits);
+        RP_CRX_TRACE("V19 target s=%d a=%x b=%x",(int)g_v19_session,a,b);
+        }
+    }
+    uint32_t mgr=*(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    struct rp_crx_bank_snapshot s;
+    if (!bad && !rp_crx_bank_snapshot(mgr,id,&s) &&
+        rp_crx_snapshot_arena_valid(&s))
+    {
+        memcpy(g_v19_prev,stop_map,sizeof(g_v19_prev));
+        g_v19_prev_valid=1u;
+        g_v19_prev_mgr=mgr; g_v19_prev_backend=s.backend;
+        g_v19_prev_mode=s.mode; g_v19_prev_cursor=s.cursor;
+        g_v19_prev_base=s.arena_base;
+    }
+    else g_v19_prev_valid=0u;
+    RP_CRX_TRACE("V19 no_write s=%d no ownership proof",
+                 (int)g_v19_session);
+}
+
+static int rp_crx_snapshot_arena_valid(const struct rp_crx_bank_snapshot *s)
+{
+    if (!rp_crx_ram_ptr(s->arena_base) || s->arena_size == 0u ||
+        s->arena_size > 0x200000u ||
+        s->arena_base > 0xBFFFFFFFu - s->arena_size)
+        return 0;
+    return s->cursor >= s->arena_base &&
+           s->cursor < s->arena_base + s->arena_size;
+}
+
+/* The v16 multi-clear probe is opt-in and cannot be retrofitted to an
+ * already-running v14 retry. Caller is the worker before S2 preflight. */
+int raw_vid_rp_crx_multi_setup(uint32_t budget)
+{
+    if (!is_camera("RP", "1.6.0") || (budget != 4u && budget != 6u && budget != 9u) ||
+        g_latch_reset_attempted || g_retry_state != RP_CRX_RETRY_NONE ||
+        g_poisoned || g_active || g_free_pending)
+        return -60;
+    uint32_t mgr = *(volatile uint32_t *)(uintptr_t)RP_CRX_ALGSMGR_OWNER_SLOT;
+    struct rp_crx_bank_snapshot s;
+    if (rp_crx_bank_snapshot(mgr, RP_CRX_ENCODER_ID_10BIT, &s) ||
+        !rp_crx_snapshot_arena_valid(&s))
+        return -61;
+    if (g_multi_enabled)
+        return budget == g_multi_budget && mgr == g_multi_manager &&
+               s.backend == g_multi_backend && s.mode == g_multi_mode &&
+               s.arena_base == g_multi_arena_base &&
+               s.arena_size == g_multi_arena_size ? 0 : -62;
+    g_multi_manager = mgr;
+    g_multi_backend = s.backend;
+    g_multi_mode = s.mode;
+    g_multi_arena_base = s.arena_base;
+    g_multi_arena_size = s.arena_size;
+    g_multi_budget = budget;
+    g_multi_enabled = 1u;
+    RP_CRX_TRACE("V16 MULTICLEAR ARM budget=%d mgr=%x arena=%x size=%x",
+                 (int)budget, mgr, s.arena_base, s.arena_size);
+    return 0;
+}
+
+/* No concurrent modes or arena rebuilds allowed during the experiment.
+ * Do not require global cursor equality: another bank may have allocated. */
+static int rp_crx_multi_validate(uint32_t mgr, uint32_t id,
+                                 struct rp_crx_bank_snapshot *s)
+{
+    if (!g_multi_enabled || !rp_crx_ram_ptr(mgr) || id >= RP_CRX_ALGSMGR_LATCH_COUNT ||
+        mgr != g_multi_manager || rp_crx_bank_snapshot(mgr, id, s) ||
+        !rp_crx_snapshot_arena_valid(s) || s->backend != g_multi_backend ||
+        s->mode != g_multi_mode || s->arena_base != g_multi_arena_base ||
+        s->arena_size != g_multi_arena_size || s->hw_active != 0u)
+        return -63;
+    if (g_multi_pending[id])
+    {
+        const struct rp_crx_bank_snapshot *old = &g_multi_cleared[id];
+        if (s->latch != 0u || s->context != old->context ||
+            s->cursor < old->cursor ||
+            memcmp(s->pointers, old->pointers, sizeof(s->pointers)) != 0)
+            return -64;
+    }
+    return 0;
+}
+
+static int rp_crx_multi_after_stop(uint32_t bits, uint32_t id,
+                                   uint32_t manager)
+{
+    struct rp_crx_bank_snapshot s;
+    int rc = rp_crx_multi_validate(manager, id, &s);
+    if (rc) return rc;
+    /* STOP must follow a successful one-frame encode and native free;
+     * the end-of-encode workspace state must have survived cleanup. */
+    if (!g_multi_inflight || g_multi_current_id != id ||
+        g_multi_clears >= g_multi_budget || g_active || g_free_pending ||
+        g_poisoned || !g_session_clean_end ||
+        g_session_good_encodes != 1u || g_session_encode_attempts != 1u ||
+        g_session_multi_bits || g_session_bits != bits ||
+        g_session_first_hw_latch != 0u ||
+        !g_multi_encode_after_valid || s.latch != 1u ||
+        s.context != g_multi_encode_after.context ||
+        s.cursor != g_multi_encode_after.cursor ||
+        memcmp(s.pointers, g_multi_encode_after.pointers, sizeof(s.pointers)) != 0)
+        return -65;
+    uint32_t end = s.arena_base + s.arena_size;
+    uint32_t spare = end - s.cursor;
+    /* Reserve room for native Canon still and any background CRX client.
+     * This is only a heuristic; no exclusive arena ownership is implied. */
+    if (spare < 0x4000u)
+    {
+        RP_CRX_TRACE("V16 LOW HEADROOM remain=%x; refuse clear", spare);
+        return -66;
+    }
+    volatile uint32_t *latch = (volatile uint32_t *)(uintptr_t)
+        (manager + RP_CRX_ALGSMGR_LATCH_OFFSET + 4u * id);
+    uint32_t sequence = g_multi_clears + 1u;
+    RP_CRX_TRACE("V16 RESET BEFORE seq=%d id=%d bits=%d cur=%x free=%x",
+                 (int)sequence, (int)id, (int)bits, s.cursor, spare);
+    /* Intent and snapshot recorded before the write, for fail-closed retry. */
+    g_multi_inflight = 0u;
+    g_multi_pending[id] = 1u;
+    g_multi_cleared[id] = s;
+    g_multi_clears++;
+    rp_crx_barrier();
+    *latch = 0u;
+    rp_crx_barrier();
+    uint32_t after = *latch;
+    RP_CRX_TRACE("V16 RESET AFTER seq=%d id=%d was=%d now=%d total=%d",
+                 (int)sequence, (int)id, (int)s.latch, (int)after,
+                 (int)g_multi_clears);
+    if (after != 0u)
+    {
+        g_poisoned = 1u;
+        g_stats.poisoned = 1u;
+        return -67;
+    }
+    rp_crx_log_snapshot("v16-postclear-preimage", id, &s);
+    return 0;
+}
