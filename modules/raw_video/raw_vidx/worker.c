@@ -3773,36 +3773,277 @@ static void worker(void)
 
             if (recording_state == INACTIVE)
             {
-                // Get mem to buffer our cropped frames.  We do this because 
-                // card write speeds are improved if we pass only large, size aligned
-                // buffers to FIO_WriteFile().  Optimal size and alignment probably
-                // varies by cam, card (manufacturer, controller, etc), card format etc.
-                //
-                // We double buffer so we can record into one as we write out the other.
-                // At this point, we don't know the required size as no image data has
-                // been sent.
+                if (is_camera("RP", "1.6.0") && !rp_start_stage_supported())
+                {
+                    RP_START_TRACE("Unsupported diagnostic stage=%d", RP_START_PROBE_STAGE);
+                    SEND_LOG_DATA_STR("ERROR: unsupported RP diagnostic stage\n");
+                    break;
+                }
+                if (rp_writer_storage_lockout)
+                {
+                    RP_START_TRACE("S36 ADAPT storage lockout; cold reboot required");
+                    SEND_LOG_DATA_STR("ERROR: previous writer drain/FIO failed; cold reboot required\n");
+                    break;
+                }
+                RP_START_TRACE("S0 worker COMMAND_START w=%d h=%d stage=%d",
+                               (int)event->w, (int)event->h, RP_START_PROBE_STAGE);
+                rp_worker_probe_frames = 0;
+                rp_worker_m2m_failed = 0;
+                rp_last_m2m_complete_us = 0;
+                rp_writer_jobs_queued = 0;
+                rp_writer_jobs_done = 0;
+                rp_writer_post_fail = 0;
+                rp_writer_max_us = 0;
+                rp_writer_batches = 0;
+                rp_writer_max_batch_frames = 0;
+                rp_writer_max_batch_bytes = 0;
+                rp_writer_rate_x100 = 0;
+                rp_writer_io_fail = 0;
+                rp_header_write_pending = 0;
+                rp_header_write_done = 0;
+                rp_header_write_failed = 0;
+                rp_header_write_ptr = NULL;
+                rp_header_write_size = 0;
+                rp_writer_coalesce_waits = 0;
+                rp_writer_coalesce_hits = 0;
+                rp_writer_coalesce_timeouts = 0;
+                rp_writer_coalesce_max_us = 0;
+                rp_writer_coalesce_total_us = 0;
+                rp_adapt_reset(&rp_adapt);
+                rp_v113_history_reset(&rp_v113_io_history);
+                rp_writer_drain_requested = 0u;
+                rp_writer_ingress_rate_x100 = 0u;
+                rp_writer_drain_rate_x100 = 0u;
+                rp_writer_recent_frame_bytes = 0u;
+                rp_ingress_window_t0 = 0u;
+                rp_ingress_window_bytes = 0u;
+                rp_drain_window_t0 = 0u;
+                rp_drain_window_bytes = 0u;
+                rp_slot_starves = 0;
+                rp_slot_min_free = 0;
+                rp_record_codec = event->codec_mode;
+                rp_record_wire_bpp = event->requested_bpp;
+                /* v23.2 dynamic-only worker: no legacy latch/retry/session
+                 * experiment is armed from the recorder. */
+                rp_crx_frame_limit = event->crx_frame_limit < 0 ? 1u :
+                                     (uint32_t)event->crx_frame_limit;
+                rp_still_session_active = event->still_session ? 1u : 0u;
+                if (rp_still_session_active)
+                    RP_START_TRACE("STILL recording begin codec=%d bpp=%d res=%d mode=%d",
+                                   event->codec_mode, event->requested_bpp,
+                                   event->resolution_mode, shooting_mode);
+                rp_crx_frames_ok = 0;
+                rp_crx_frames_failed = 0;
+                rp_crx_total_input_us = 0;
+                rp_crx_total_encode_us = 0;
+                rp_crx_total_detach_us = 0;
+                rp_crx_total_compact_us = 0;
+                rp_crx_total_payload_bytes = 0;
+                rp_crx_total_m2m_blocks = 0;
+                rp_crx_release_failures = 0;
+                rp_crx_direct_w3_frames = 0;
+                rp_crx_staged_input_frames = 0;
+                rp_crx_cmp1_size = 0;
+                rp_crx_value_shift = RP_CRX_VALUE_SHIFT_CURRENT;
+                memset(rp_crx_cmp1_cache, 0, sizeof(rp_crx_cmp1_cache));
+                header_size = 0;
+                const char *codec_name =
+                    rp_record_codec == RAW_VID_CODEC_CRX ? "crx-lossless" :
+                    rp_record_codec == RAW_VID_CODEC_CRAW ? "craw-lossy" : "raw";
+                RP_START_TRACE("codec=%d (%s) crx_limit=%d", rp_record_codec,
+                               codec_name, (int)rp_crx_frame_limit);
+
+                if (RP_CRX_ROUNDTRIP_VERIFY &&
+                    is_camera("RP", "1.6.0") &&
+                    rp_record_codec == RAW_VID_CODEC_CRX &&
+                    rp_crx_frame_limit != 1u)
+                {
+                    RP_START_TRACE("CRX REF reject frame_limit=%d (must be 1)",
+                                   (int)rp_crx_frame_limit);
+                    SEND_LOG_DATA_STR("ERROR: CRX round-trip verification build requires frame limit = 1\n");
+                    break;
+                }
+
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 0)
+                {
+                    RP_START_TRACE("S0 PASS queue+worker only");
+                    break;
+                }
+
+                if (is_camera("RP", "1.6.0") &&
+                    RP_START_PROBE_STAGE >= 19 &&
+                    RP_START_PROBE_STAGE <= 31)
+                {
+                    RP_START_TRACE("S%d RP mem2mem probe begin", RP_START_PROBE_STAGE);
+                    err = raw_vid_rp_probe_m2m(RP_START_PROBE_STAGE);
+                    RP_START_TRACE("S%d RP mem2mem probe returned rc=%d",
+                                   RP_START_PROBE_STAGE, err);
+                    break;
+                }
+
+                // Legacy raw_vidx uses two large accumulation buffers.
+                // RP stage36 v3C defers output allocation until RAW geometry
+                // and requested BPP are frozen, then allocates per-frame slots.
                 if (crop_buf != NULL)
                 {
                     SEND_LOG_DATA_STR("ERROR: crop_buf not null on COMMAND_START\n");
                     break;
                 }
-                alloc_crop_bufs(crop_bufs);
-                if (crop_bufs[0].start == NULL
-                    || crop_bufs[1].start == NULL)
+
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 36)
                 {
-                    SEND_LOG_DATA_STR("ERROR: could not obtain crop bufs, cannot start\n");
+                    RP_START_TRACE("S1 v3C frame-slot allocation deferred");
+                }
+                else
+                {
+                    alloc_crop_bufs(crop_bufs, event->resolution_mode,
+                                    event->requested_bpp);
+                    if (crop_bufs[0].start == NULL
+                        || crop_bufs[1].start == NULL)
+                    {
+                        SEND_LOG_DATA_STR("ERROR: could not obtain crop bufs, cannot start\n");
+                        break;
+                    }
+                    #ifdef RAW_VID_LOG
+                    snprintf(log_buf, buf_size, "buf[0] and buf[1] size: %d, %d\n",
+                             crop_bufs[0].end - crop_bufs[0].cur,
+                             crop_bufs[1].end - crop_bufs[1].cur);
+                    send_log_data_str(log_buf);
+                    #endif
+                    crop_buf = &crop_bufs[0];
+                    RP_START_TRACE("S1 crop alloc PASS b0=%x n0=%d b1=%x n1=%d",
+                                   (uint32_t)crop_bufs[0].start,
+                                   (int)(crop_bufs[0].end - crop_bufs[0].start),
+                                   (uint32_t)crop_bufs[1].start,
+                                   (int)(crop_bufs[1].end - crop_bufs[1].start));
+                }
+
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 1)
+                {
+                    free_crop_bufs(crop_bufs);
+                    crop_buf = NULL;
                     break;
                 }
-                #ifdef RAW_VID_LOG
-                snprintf(log_buf, buf_size, "buf[0] and buf[1] size: %d, %d\n",
-                         crop_bufs[0].end - crop_bufs[0].cur,
-                         crop_bufs[1].end - crop_bufs[1].cur);
-                send_log_data_str(log_buf);
-                #endif
-                crop_buf = &crop_bufs[0];
 
-                // Set LV to raw
+                /* Keep module load passive.  Initialize the RP-specific
+                 * backend only when the user actually starts recording. */
+                if (raw_vid_rp_init(event_q))
+                {
+                    RP_START_TRACE("S2 FAIL rp_backend_init");
+                    SEND_LOG_DATA_STR("ERROR: RP backend init failed\n");
+                    free_crop_bufs(crop_bufs);
+                    crop_buf = NULL;
+                    break;
+                }
+                RP_START_TRACE("S2 rp_backend_init PASS pblock=%x",
+                               raw_lv_get_edmac_channel_addr());
+
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 36)
+                {
+                    int preflight_rc = raw_vid_rp_session_preflight();
+                    int crx_preflight_rc =
+                        raw_vid_codec_is_crx(rp_record_codec)
+                        ? raw_vid_rp_crx_preflight_mode(
+                            (uint32_t)event->requested_bpp,
+                            raw_vid_codec_is_lossy_crx(rp_record_codec))
+                        : 0;
+                    RP_START_TRACE("S2 PREFLIGHT backend=%d crx=%d",
+                                   preflight_rc, crx_preflight_rc);
+                    if (preflight_rc || crx_preflight_rc)
+                    {
+                        if (crx_preflight_rc == -5)
+                        {
+                            SEND_LOG_DATA_STR("ERROR: Canon CRX encoder state was not reinitialized after the previous session; cold boot required\n");
+                        }
+                        else
+                        {
+                            SEND_LOG_DATA_STR("ERROR: RP previous session did not return to a clean reusable state; cold boot required\n");
+                        }
+                        free_crop_bufs(crop_bufs);
+                        crop_buf = NULL;
+                        break;
+                    }
+                }
+
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 2)
+                {
+                    free_crop_bufs(crop_bufs);
+                    crop_buf = NULL;
+                    break;
+                }
+
+                // Set LV to raw. A photo dial change after queueing MUST
+                // be noticed before touching the Canon live RAW pipeline.
+                if (event->still_session && !raw_vid_still_mode_ok())
+                {
+                    RP_START_TRACE("STILL CANCEL before RAW request lv=%d mode=%d",
+                                   lv, shooting_mode);
+                    free_crop_bufs(crop_bufs);
+                    crop_buf = NULL;
+                    break;
+                }
+                if (event->still_session)
+                    RP_START_TRACE("STILL before raw_lv_request lv=%d mode=%d",
+                                   lv, shooting_mode);
+                RP_START_TRACE("S3 before raw_lv_request");
                 raw_lv_request();
+
+                if (is_camera("RP", "1.6.0"))
+                {
+                    int sync_rc = raw_vid_rp_sync_raw_info();
+                    RP_START_TRACE("S3 RP raw_info sync rc=%d", sync_rc);
+                    if (sync_rc)
+                    {
+                        SEND_LOG_DATA_STR("ERROR: RP RAW hardware geometry sync failed\n");
+                        raw_lv_release();
+                        free_crop_bufs(crop_bufs);
+                        crop_buf = NULL;
+                        break;
+                    }
+                }
+
+                if (event->still_session)
+                    RP_START_TRACE("STILL RAWINFO PASS mode=%d wh=%d,%d pitch=%d bpp=%d",
+                                   shooting_mode, raw_info.width, raw_info.height,
+                                   raw_info.pitch, raw_info.bits_per_pixel);
+                RP_START_TRACE("S3 raw_lv_request returned pblock=%x buf=%x wh=%d,%d pitch=%d size=%d bpp=%d",
+                               raw_lv_get_edmac_channel_addr(), (uint32_t)raw_info.buffer,
+                               raw_info.width, raw_info.height, raw_info.pitch,
+                               raw_info.frame_size, raw_info.bits_per_pixel);
+
+                if (is_camera("RP", "1.6.0"))
+                {
+                    uint32_t crop_x = 0, crop_y = 0, crop_w = 0, crop_h = 0;
+                    int res_rc = raw_vid_resolve_capture_area(event->resolution_mode,
+                                                              &crop_x, &crop_y,
+                                                              &crop_w, &crop_h);
+                    RP_START_TRACE("RES mode=%d raw=%dx%d rc=%d crop=%d,%d %dx%d",
+                                   event->resolution_mode, raw_info.width, raw_info.height,
+                                   res_rc, (int)crop_x, (int)crop_y,
+                                   (int)crop_w, (int)crop_h);
+                    if (res_rc)
+                    {
+                        SEND_LOG_DATA_STR("ERROR: selected RP RAW resolution does not fit current RAW channel\n");
+                        raw_lv_release();
+                        free_crop_bufs(crop_bufs);
+                        crop_buf = NULL;
+                        break;
+                    }
+
+                    event->x = crop_x;
+                    event->y = crop_y;
+                    event->w = crop_w;
+                    event->h = crop_h;
+                }
+
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 3)
+                {
+                    raw_lv_release();
+                    RP_START_TRACE("S3 PASS raw_lv_release returned");
+                    free_crop_bufs(crop_bufs);
+                    crop_buf = NULL;
+                    break;
+                }
 
                 // Get new save file
                 if (raw_vid_fp != NULL)
@@ -3811,7 +4052,9 @@ static void worker(void)
                     break;
                 }
 
-                if (get_numbered_file_name("tst%02d.mlv", 99, mlv_name, sizeof(mlv_name)) > -1)
+                if (get_numbered_file_name(rp_w3_matrix_case_active()
+                      ? rp_w3_matrix_video_pattern() : "tst%02d.mlv", 99,
+                      mlv_name, sizeof(mlv_name)) > -1)
                 {
                     raw_vid_fp = FIO_CreateFile(mlv_name);
                     if (raw_vid_fp == NULL)
@@ -3826,6 +4069,23 @@ static void worker(void)
                     break;
                 }
 
+                RP_START_TRACE("S4 file create PASS fp=%x name=%s",
+                               (uint32_t)raw_vid_fp, mlv_name);
+                rp_w3_matrix_stage(20,0);
+                if (rp_w3_matrix_case_active())
+                    rp_w3_matrix_file(mlv_name);
+
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 4)
+                {
+                    FIO_CloseFile(raw_vid_fp);
+                    raw_vid_fp = NULL;
+                    raw_lv_release();
+                    free_crop_bufs(crop_bufs);
+                    crop_buf = NULL;
+                    RP_START_TRACE("S4 PASS file closed + RAW released");
+                    break;
+                }
+
                 // FIXME from here onwards we want to cleanup the file if we error.
                 // Really, we need to revisit error conditions in all states,
                 // and ensure we handle correctly (e.g. flushing pending data).
@@ -3833,19 +4093,79 @@ static void worker(void)
                 session.fps = fps_get_current_x1000();
                 session.res_x = event->w;
                 session.res_y = event->h;
+                session.native_crx = (is_camera("RP", "1.6.0") &&
+                                      raw_vid_codec_is_crx(rp_record_codec));
+                session.bits_per_pixel = is_camera("RP", "1.6.0")
+                                       ? event->requested_bpp
+                                       : 14;
+                session.wire_bits_per_pixel = rp_record_wire_bpp;
+                if (is_camera("RP", "1.6.0"))
+                {
+                    session.crop_offset_x = event->x;
+                    session.crop_offset_y = event->y;
+                    session.pan_offset_x = event->x;
+                    session.pan_offset_y = event->y;
+                }
+                else
+                {
+                    session.crop_offset_x = 0;
+                    session.crop_offset_y = 0;
+                    session.pan_offset_x = 0;
+                    session.pan_offset_y = 0;
+                }
+                video_frame_count = 0;
 
                 err = start_mlv_session(&session);
+                rp_w3_matrix_stage(30,err);
                 if (err)
                 {
                     SEND_LOG_DATA_STR("ERROR: failed to start mlv session\n");
                     break;
                 }
 
-                // write standard header blocks
-                header_size = write_file_headers(header_buf, header_buf + header_buf_size);
-                if (header_size == 0)
+                /*
+                 * Revision-2 CRX needs the exact Canon CMP1 in CRXI.  That blob
+                 * becomes available only after the first successful encode, so
+                 * stage36 native-CRX defers the complete stream header until
+                 * frame 0.  The first queued slot will then contain:
+                 *
+                 *   MLVI RAWI RAWC CRXI(v2+CMP1) metadata... VIDF CRX-sample
+                 *
+                 * and STOP can still seek to offset 0 and rewrite only the
+                 * fixed header region with the final MLVI frame count.
+                 */
+                if (session.native_crx &&
+                    is_camera("RP", "1.6.0") &&
+                    RP_START_PROBE_STAGE == 36)
                 {
-                    SEND_LOG_DATA_STR("ERROR: failed to write mlv headers\n");
+                    header_size = 0;
+                    RP_START_TRACE("CRX REV2 header deferred until first CMP1");
+                }
+                else
+                {
+                    header_size = write_file_headers(
+                        header_buf, header_buf + header_buf_size);
+                    if (header_size == 0)
+                    {
+                        SEND_LOG_DATA_STR("ERROR: failed to write mlv headers\n");
+                        break;
+                    }
+                    FIO_WriteFile(raw_vid_fp, header_buf, header_size);
+                    rp_w3_matrix_stage(40,(int)header_size);
+                    RP_START_TRACE("S5 MLV header PASS bytes=%d fps=%d raw_wh=%d,%d codec=%d",
+                                   (int)header_size, session.fps,
+                                   raw_info.width, raw_info.height, rp_record_codec);
+                }
+
+                if (is_camera("RP", "1.6.0") && RP_START_PROBE_STAGE == 5)
+                {
+                    stop_mlv_session();
+                    FIO_CloseFile(raw_vid_fp);
+                    raw_vid_fp = NULL;
+                    raw_lv_release();
+                    free_crop_bufs(crop_bufs);
+                    crop_buf = NULL;
+                    RP_START_TRACE("S5 PASS MLV closed + RAW released");
                     break;
                 }
                 FIO_WriteFile(raw_vid_fp, header_buf, header_size);
