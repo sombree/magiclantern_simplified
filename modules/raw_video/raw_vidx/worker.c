@@ -942,6 +942,275 @@ static uint32_t rp_calc_frame_slot_stride(uint32_t payload_size)
     uint32_t minimum = EDMAC_ALIGNMENT + payload_size;
     return ALIGN_UP(minimum, RP_FRAME_SLOT_ALIGN);
 }
+
+/* Add one Canon memSuite chunk using the same structural idea as mlv_lite:
+ * max-size FREE entries first, followed by equally many RESERVED descriptors.
+ * Reserved descriptors are metadata capacity that allows compressed frames to
+ * hand their unused tails forward without allocating/copying another buffer. */
+static int rp_add_frame_region(uintptr_t raw_ptr, uint32_t raw_size,
+                               uint32_t source_index, int is_ssraw)
+{
+    if (raw_size == 0u ||
+        rp_frame_chunk_count >= RP_FRAME_CHUNK_MAX ||
+        rp_frame_slot_count >= RP_FRAME_SLOT_MAX)
+    {
+        return 0;
+    }
+
+    uintptr_t aligned = ALIGN_UP(raw_ptr, RP_FRAME_SLOT_ALIGN);
+    uint32_t align_loss = (uint32_t)(aligned - raw_ptr);
+
+    if (raw_size <= align_loss)
+    {
+        rp_frame_waste_bytes += raw_size;
+        return 0;
+    }
+
+    /* Exclude intersecting virtual ranges. This is not a proof that two bus
+     * addresses cannot alias downstream of MMU, but catches obvious overlap. */
+    if (raw_ptr > 0xffffffffu || raw_size > 0xffffffffu-(uint32_t)raw_ptr)
+        return -3;
+    if (!is_ssraw && (uint32_t)raw_ptr < 0xA77B0000u &&
+        (uint32_t)raw_ptr + raw_size > 0xA0000000u)
+        return -4;
+    uintptr_t mapped = is_ssraw ? aligned :
+                       (uintptr_t)UNCACHEABLE((void *)aligned);
+    for (uint32_t c=0; c<rp_frame_chunk_count; ++c)
+    {
+        uintptr_t old=(uintptr_t)rp_frame_chunks[c].start;
+        if (mapped < old+rp_frame_chunks[c].bytes &&
+            old < mapped+(raw_size-align_loss))
+            return -5;
+    }
+    uint32_t raw_usable = raw_size - align_loss;
+    /* Dynamic RESERVED descriptors may start life at chunk_end and later grow
+     * backwards into FREE slots.  Therefore BOTH ends of the represented
+     * chunk must be sector-aligned; otherwise a zero-size RESERVED entry at an
+     * unaligned physical end could later become an unaligned DMA/FIO slot. */
+    uint32_t usable = raw_usable & ~(RP_FRAME_SLOT_ALIGN - 1u);
+    uint32_t tail_align_loss = raw_usable - usable;
+    uint32_t possible_full = usable / rp_frame_slot_stride;
+    uint32_t metadata_left = RP_FRAME_SLOT_MAX - rp_frame_slot_count;
+    uint32_t reserve_per_full =
+        (rp_record_codec == RAW_VID_CODEC_CRAW) ? RP_CRAW_RESERVED_PER_FULL :
+        (rp_record_codec == RAW_VID_CODEC_CRX)  ? RP_CRX_RESERVED_PER_FULL :
+                                                  RP_RAW_RESERVED_PER_FULL;
+    uint32_t metadata_per_full = 1u + reserve_per_full;
+    uint32_t use_full = MIN(possible_full, metadata_left / metadata_per_full);
+
+    if (use_full == 0u)
+    {
+        RP_START_TRACE("S36 DYNSLOT chunk=%d skip bytes=%dKB stride=%d meta=%d",
+                       (int)source_index, (int)(usable / 1024u),
+                       (int)rp_frame_slot_stride, (int)metadata_left);
+        rp_frame_waste_bytes += raw_size;
+        return 0;
+    }
+
+    uint32_t wanted_reserve = use_full * reserve_per_full;
+    uint32_t reserve_count = MIN(wanted_reserve, metadata_left - use_full);
+    uint32_t chunk_index = rp_frame_chunk_count;
+    uint32_t first_slot = rp_frame_slot_count;
+    struct rp_frame_chunk *chunk = &rp_frame_chunks[chunk_index];
+    chunk->_buf = NULL;
+    /* RPSS v105: 0xA0... bank already maps Normal non-cacheable in L1.
+     * UNCACHEABLE() may synthesize a non-equivalent VA; preserve native A. */
+    chunk->start = is_ssraw ? (char *)aligned :
+                   (char *)UNCACHEABLE((void *)aligned);
+    chunk->bytes = usable;
+    chunk->first_slot = first_slot;
+    chunk->slot_count = use_full + reserve_count;
+
+    char *ptr = chunk->start;
+    for (uint32_t n = 0; n < use_full; n++)
+    {
+        struct rp_frame_slot *slot = &rp_frame_slots[rp_frame_slot_count++];
+        slot->start = ptr;
+        slot->end = ptr + rp_frame_slot_stride;
+        slot->used = 0;
+        slot->frame_number = 0;
+        slot->chunk_index = (uint16_t)chunk_index;
+        slot->chunk_pos = (uint16_t)n;
+        slot->state = RP_FRAME_SLOT_FREE;
+        ptr += rp_frame_slot_stride;
+    }
+
+    char *chunk_end = chunk->start + usable;
+    for (uint32_t n = 0; n < reserve_count; n++)
+    {
+        struct rp_frame_slot *slot = &rp_frame_slots[rp_frame_slot_count++];
+        slot->start = ptr;
+        slot->end = (n == 0u) ? chunk_end : ptr;
+        slot->used = 0;
+        slot->frame_number = 0;
+        slot->chunk_index = (uint16_t)chunk_index;
+        slot->chunk_pos = (uint16_t)(use_full + n);
+        slot->state =
+            (n == 0u && (uint32_t)(slot->end - slot->start) >= rp_frame_slot_stride)
+            ? RP_FRAME_SLOT_FREE
+            : RP_FRAME_SLOT_RESERVED;
+        ptr = slot->end;
+    }
+
+    rp_frame_chunk_count++;
+    rp_frame_output_bytes += usable;
+    rp_frame_waste_bytes += align_loss + tail_align_loss;
+
+    RP_START_TRACE("S36 DYNSLOT chunk=%d run=%d base=%x usable=%dKB full=%d reserve=%d rpf=%d tail=%dKB alignWaste=%d",
+                   (int)source_index, (int)chunk_index,
+                   (uint32_t)chunk->start, (int)(usable / 1024u),
+                   (int)use_full, (int)reserve_count, (int)reserve_per_full,
+                   (int)((usable - use_full * rp_frame_slot_stride) / 1024u),
+                   (int)(align_loss + tail_align_loss));
+    return (int)use_full;
+}
+
+static int rp_add_shoot_suite_chunk(struct memChunk *mem_chunk,
+                                    uint32_t suite_chunk_index)
+{
+    if (mem_chunk == NULL) return 0;
+    return rp_add_frame_region((uintptr_t)GetMemoryAddressOfMemoryChunk(mem_chunk),
+                               (uint32_t)GetSizeOfMemoryChunk(mem_chunk),
+                               suite_chunk_index,0);
+}
+
+static int rp_alloc_frame_slots(uint32_t payload_size)
+{
+    if (rp_v110_owner_quarantine || rp_writer_storage_lockout) return -99;
+    rp_free_frame_slots();
+    if (rp_v110_owner_quarantine) return -99;
+    rp_frame_slot_stride = rp_calc_frame_slot_stride(payload_size);
+
+#if RP_V110_MEM3_2X32
+    /* Explicit 2 x 32 MiB requests go through Canon RscMgr (Mem3).
+     * Neither request implies one *physically* contiguous 32-MiB chunk.
+     * The existing per-chunk slot metadata honors arbitrary returned pieces. */
+    for (uint32_t p=0; p<2u; ++p)
+    {
+        rp_v110_mem3[p] = shoot_malloc_suite(RP_V110_MEM3_BLOCK);
+        if (!rp_v110_mem3[p])
+        {
+            RP_START_TRACE("SS110 MEM3 allocation FAIL n=%d bytes=%d",(int)p,(int)RP_V110_MEM3_BLOCK);
+            rp_free_frame_slots();
+            return -20-(int)p;
+        }
+        uint32_t nbytes=(uint32_t)GetSizeOfMemorySuite(rp_v110_mem3[p]);
+        if (nbytes<RP_V110_MEM3_BLOCK)
+        {
+            RP_START_TRACE("SS110 MEM3 short n=%d bytes=%d",(int)p,(int)nbytes);
+            rp_free_frame_slots();
+            return -23;
+        }
+        rp_frame_suite_bytes+=nbytes;
+        uint32_t chunks=(uint32_t)GetNumberOfChunks(rp_v110_mem3[p]);
+        rp_frame_suite_chunks+=chunks;
+        struct memChunk *m=GetFirstChunkFromSuite(rp_v110_mem3[p]);
+        uint32_t counted=0;
+        while (m)
+        {
+            if (rp_frame_chunk_count>=RP_FRAME_CHUNK_MAX ||
+                rp_frame_slot_count+2u>=RP_FRAME_SLOT_MAX) break;
+            int added=rp_add_shoot_suite_chunk(m,(p<<16)|counted);
+            if (added<0)
+            {
+                RP_START_TRACE("SS110 MEM3 invalid n=%d chunk=%d rc=%d",
+                               (int)p,(int)counted,added);
+                rp_free_frame_slots();
+                return -27;
+            }
+            m=GetNextMemoryChunk(rp_v110_mem3[p],m);
+            counted++;
+        }
+        RP_START_TRACE("SS110 MEM3 n=%d bytes=%d chunks=%d seen=%d",
+                       (int)p,(int)nbytes,(int)chunks,(int)counted);
+        if (counted!=chunks)
+        {
+            RP_START_TRACE("SS110 MEM3 truncated n=%d",(int)p);
+            rp_free_frame_slots();
+            return -24;
+        }
+    }
+#if RP_V110_SSRAM_OUTPUT
+    {
+        uint32_t base=0,bytes=0;
+        int rc=rp_ssraw_v110_acquire(&base,&bytes);
+        RP_START_TRACE("SS110 SRM acquire rc=%d addr=%x bytes=%x",rc,base,bytes);
+        if (rc || base!=0xA0000000u || bytes!=0x077B0000u)
+        {
+            /* Native job may remain pending in resident CORE.  Do not use
+             * any unexpected bank or retry before cold boot. */
+            rp_v110_owner_quarantine=1;
+            rp_writer_storage_lockout=1;
+            return -25;
+        }
+        rp_v110_ssraw_addr=base;
+        rp_v110_ssraw_bytes=bytes;
+        int added=rp_add_frame_region((uintptr_t)base,bytes,0x38u,1);
+        RP_START_TRACE("SS110 SRM REGION added=%d total=%d bytes=%d",added,
+                       (int)rp_frame_slot_count,(int)rp_frame_output_bytes);
+        if (added<=0)
+        {
+            rp_free_frame_slots();
+            return -26;
+        }
+    }
+#endif
+#else
+    rp_frame_suite = shoot_malloc_suite(0);
+    if (rp_frame_suite == NULL)
+    {
+        RP_START_TRACE("S36 DYNSLOT suite alloc FAIL payload=%d stride=%d source=%dKB",
+                       (int)payload_size, (int)rp_frame_slot_stride,
+                       (int)(raw_vid_rp_capture_buffer_bytes() / 1024u));
+        rp_clear_frame_slot_metadata();
+        return -1;
+    }
+
+    rp_frame_suite_bytes = (uint32_t)GetSizeOfMemorySuite(rp_frame_suite);
+    rp_frame_suite_chunks = (uint32_t)GetNumberOfChunks(rp_frame_suite);
+
+    struct memChunk *mem_chunk = GetFirstChunkFromSuite(rp_frame_suite);
+    uint32_t suite_chunk_index = 0;
+    while (mem_chunk != NULL)
+    {
+        if (rp_frame_chunk_count >= RP_FRAME_CHUNK_MAX ||
+            rp_frame_slot_count + 2u >= RP_FRAME_SLOT_MAX)
+        {
+            RP_START_TRACE("S36 DYNSLOT truncate chunk=%d runs=%d entries=%d",
+                           (int)suite_chunk_index, (int)rp_frame_chunk_count,
+                           (int)rp_frame_slot_count);
+            break;
+        }
+
+        rp_add_shoot_suite_chunk(mem_chunk, suite_chunk_index);
+        mem_chunk = GetNextMemoryChunk(rp_frame_suite, mem_chunk);
+        suite_chunk_index++;
+    }
+#endif
+
+    uint32_t free_count = rp_count_free_frame_slots();
+    if (free_count < RP_FRAME_SLOT_MIN)
+    {
+        RP_START_TRACE("S36 DYNSLOT alloc FAIL free=%d entries=%d suite=%dKB stride=%d",
+                       (int)free_count, (int)rp_frame_slot_count,
+                       (int)(rp_frame_suite_bytes / 1024u),
+                       (int)rp_frame_slot_stride);
+        rp_free_frame_slots();
+        return -2;
+    }
+
+    rp_slot_min_free = free_count;
+    uint32_t reserved = rp_count_reserved_frame_slots();
+    rp_slot_reserved_peak = reserved;
+
+    RP_START_TRACE("S36 DYNSLOT alloc PASS free=%d reserved=%d entries=%d runs=%d stride=%d output=%dKB suite=%dKB waste=%dKB",
+                   (int)free_count, (int)reserved, (int)rp_frame_slot_count,
+                   (int)rp_frame_chunk_count, (int)rp_frame_slot_stride,
+                   (int)(rp_frame_output_bytes / 1024u),
+                   (int)(rp_frame_suite_bytes / 1024u),
+                   (int)(rp_frame_waste_bytes / 1024u));
+    return 0;
+}
 static void alloc_crop_bufs(struct crop_buf crop_bufs[])
 {
     if (crop_bufs[0]._buf != NULL
