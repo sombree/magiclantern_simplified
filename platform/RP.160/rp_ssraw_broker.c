@@ -247,3 +247,199 @@ static int rp_ss114_release_core(struct rp_ss114_round *r, uint32_t generation)
     }
     return 0;
 }
+
+/* This task never unloads. It serializes all native jobs, and a missing
+ * callback parks it indefinitely rather than accepting another generation. */
+static void rp_ss114_task(void *arg)
+{
+    (void)arg;
+    struct rp_ss110_core *c=&rp_ss110;
+    for (;;) {
+        if (c->bad_callbacks && c->state!=RP_SS110_QUARANTINE)
+            c->state=RP_SS110_QUARANTINE;
+        if (c->state!=RP_SS110_START) {
+            msleep(RP_SS110_POLL_MS);
+            continue;
+        }
+        uint32_t generation=c->active_generation;
+        if (generation>=RP_SS114_MAX_SESSIONS) {
+            c->state=RP_SS110_QUARANTINE;
+            continue;
+        }
+        struct rp_ss114_round *r=&rp_ss114_rounds[generation];
+        /* If acquire timed out before the job was issued, do not issue it. */
+        if (c->cancelled) {
+            c->state=RP_SS110_FAILED;
+            continue;
+        }
+        r->before_word1=rp_ss103_r32(RP_SS103_OCC_WORD1);
+        c->state=RP_SS110_PENDING;
+        __sync_synchronize();
+        DryosDebugMsg(0,15,"RPSS114 ALLOC gen=%d slots=2 before=%x",
+                      generation,r->before_word1);
+        RP_SS110_NATIVE_ALLOC(2u,rp_ss114_acq_cb,r);
+        while (r->alloc_publish!=2u) {
+            if (c->bad_callbacks) c->state=RP_SS110_QUARANTINE;
+            msleep(RP_SS110_POLL_MS);
+        }
+        __sync_synchronize();
+        if (c->bad_callbacks || r->alloc_seen!=1u) {
+            c->state=RP_SS110_QUARANTINE;
+            continue;
+        }
+        if (r->count==0u) {
+            DryosDebugMsg(0,15,"RPSS114 DENIED gen=%d code=%x",
+                          generation,r->error_code);
+            c->state=RP_SS110_FAILED;
+            continue;
+        }
+        if (r->error_code || r->count>2u ||
+            !rp_ss114_known_bank(r->addresses[0]) ||
+            (r->count==2u && (!rp_ss114_known_bank(r->addresses[1]) ||
+                              r->addresses[0]==r->addresses[1]))) {
+            DryosDebugMsg(0,15,"RPSS114 GRANT_BAD gen=%d n=%d a=%x b=%x code=%x",
+                generation,r->count,r->addresses[0],r->addresses[1],r->error_code);
+            c->state=RP_SS110_QUARANTINE; /* cannot safely guess ownership */
+            continue;
+        }
+        /* A-only is the proven output-buffer lease contract. An unexpected
+         * valid B grant can be freed, but never exposed to the module. */
+        int eligible=(r->count==1u && r->addresses[0]==RP_SS103_A_RAW &&
+              (rp_ss103_r32(RP_SS103_OCC_WORD1)&RP_SS103_FLAG_A));
+        if (!eligible || c->cancelled) {
+            DryosDebugMsg(0,15,"RPSS114 NO_LEASE gen=%d n=%d cancelled=%d",
+                          generation,r->count,c->cancelled);
+            int rc=rp_ss114_release_core(r,generation);
+            c->state=rc ? RP_SS110_QUARANTINE : RP_SS110_FAILED;
+            continue;
+        }
+        /* Offer / acceptance handshake closes the v110 deadline race.
+         * HELD means the public acquire() irrevocably accepted this lease. */
+        c->state=RP_SS114_OFFERED;
+        __sync_synchronize();
+        while (c->state==RP_SS114_OFFERED || c->state==RP_SS110_HELD) {
+            if (c->bad_callbacks) c->state=RP_SS110_QUARANTINE;
+            else if (c->cancelled)
+                __sync_bool_compare_and_swap(&c->state,RP_SS114_OFFERED,
+                                             RP_SS110_RELEASE_REQUEST);
+            msleep(RP_SS110_POLL_MS);
+        }
+        if (c->state!=RP_SS110_RELEASE_REQUEST) continue;
+        int rc=rp_ss114_release_core(r,generation);
+        if (rc) {
+            c->state=RP_SS110_QUARANTINE;
+            continue;
+        }
+        if (c->cancelled) {
+            c->state=RP_SS110_FAILED;
+            DryosDebugMsg(0,15,"RPSS114 LATE_RELEASED gen=%d",generation);
+        } else if (c->release_timeout_latch) {
+            c->state=RP_SS110_QUARANTINE;
+            DryosDebugMsg(0,15,"RPSS114 FREE_LATE gen=%d restart_required=1",generation);
+        } else {
+            c->state=RP_SS110_RELEASED;
+            DryosDebugMsg(0,15,"RPSS114 RELEASED gen=%d ready_next=1",generation);
+        }
+    }
+}
+
+/* Public API retained to avoid changing the proven raw_vidx v113.1 writer.
+ * A new session is possible only after the prior native free completed,
+ * restored the A/B occupancy flags, and the next preflight succeeds. */
+__attribute__((used,externally_visible))
+int rp_ssraw_v110_acquire(uint32_t *base, uint32_t *bytes)
+{
+    struct rp_ss110_core *c=&rp_ss110;
+    if (!base || !bytes) return -10;
+    *base=*bytes=0;
+    if (c->bad_callbacks) return -15;
+    if (c->release_timeout_latch) return -17;
+    if (!rp_ss103_preflight()) return -11;
+    uint32_t state=c->state;
+    if (state!=RP_SS110_UNUSED && state!=RP_SS110_RELEASED) return -12;
+    if (!__sync_bool_compare_and_swap(&c->state,state,RP_SS114_PREPARE)) return -12;
+    if (state==RP_SS110_UNUSED &&
+        !__sync_bool_compare_and_swap(&rp_ss103_attempted,0,1)) {
+        c->state=RP_SS110_QUARANTINE; /* v103 has native ownership */
+        return -12;
+    }
+    uint32_t generation=c->generations_used;
+    if (generation>=RP_SS114_MAX_SESSIONS) {
+        c->state=RP_SS110_QUARANTINE;
+        DryosDebugMsg(0,15,"RPSS114 max generations=%d; reboot",RP_SS114_MAX_SESSIONS);
+        return -16;
+    }
+    struct rp_ss114_round *r=&rp_ss114_rounds[generation];
+    /* This generation has never been used; its callback counters are zero. */
+    r->free_cookie[0].generation=generation;
+    r->free_cookie[0].slot=0u;
+    r->free_cookie[1].generation=generation;
+    r->free_cookie[1].slot=1u;
+    c->active_generation=generation;
+    c->generations_used=generation+1u;
+    c->cancelled=0u;
+    if (!c->task_started) {
+        uint32_t tid=task_create("RPSS114",0x1c,0x3000,(void *)rp_ss114_task,0);
+        if (!tid) {
+            c->state=RP_SS110_QUARANTINE;
+            DryosDebugMsg(0,15,"RPSS114 TASK_FAIL");
+            return -13;
+        }
+        c->task_started=1u;
+    }
+    __sync_synchronize();
+    c->state=RP_SS110_START;
+    uint32_t start=(uint32_t)get_ms_clock();
+    while ((uint32_t)get_ms_clock()-start<RP_SS110_WAIT_MS) {
+        if (__sync_bool_compare_and_swap(&c->state,RP_SS114_OFFERED,
+                                         RP_SS110_HELD)) {
+            *base=RP_SS103_A_RAW;
+            *bytes=RP_SS103_BANK_BYTES;
+            DryosDebugMsg(0,15,"RPSS114 HELD gen=%d addr=%x bytes=%x",
+                          generation,*base,*bytes);
+            return 0;
+        }
+        if (c->state==RP_SS110_FAILED || c->state==RP_SS110_QUARANTINE)
+            return -14;
+        msleep(RP_SS110_POLL_MS);
+    }
+    /* No caller receives a lease once abandoned; any late valid grant is
+     * freed by the permanent worker using its immutable generation cookie. */
+    c->cancelled=1u;
+    __sync_synchronize();
+    __sync_bool_compare_and_swap(&c->state,RP_SS114_OFFERED,
+                                 RP_SS110_RELEASE_REQUEST);
+    DryosDebugMsg(0,15,"RPSS114 TIMEOUT gen=%d native job NOT cancelled",generation);
+    return -2;
+}
+
+__attribute__((used,externally_visible))
+int rp_ssraw_v110_release(void)
+{
+    struct rp_ss110_core *c=&rp_ss110;
+    if (!__sync_bool_compare_and_swap(&c->state,RP_SS110_HELD,
+                                      RP_SS110_RELEASE_REQUEST)) return -1;
+    uint32_t start=(uint32_t)get_ms_clock();
+    while ((uint32_t)get_ms_clock()-start<RP_SS110_WAIT_MS) {
+        if (c->state==RP_SS110_RELEASED) return 0;
+        if (c->state==RP_SS110_QUARANTINE || c->state==RP_SS110_FAILED)
+            return -3;
+        msleep(RP_SS110_POLL_MS);
+    }
+    c->release_timeout_latch=1u;
+    __sync_synchronize();
+    return -2; /* free may still be pending; no further lease this boot */
+}
+
+__attribute__((used,externally_visible))
+uint32_t rp_ssraw_v110_state(void)
+{
+    return rp_ss110.state;
+}
+
+/* Optional diagnostics for a future per-session log/UI. */
+__attribute__((used,externally_visible))
+uint32_t rp_ssraw_v114_sessions_used(void)
+{
+    return rp_ss110.generations_used;
+}
