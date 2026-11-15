@@ -47,6 +47,7 @@
 
 #include "raw_vid.h" // FIXME only for debug logging, probably move the SEND macro to main log.h
 #include "mlv_3.h"
+#include "mlv_fps_rational.h"
 #include "rp_crx_format.h"
 
 #define MLV_VERSION_STRING "v3.0"
@@ -476,11 +477,9 @@ static int init_block(mlv_block_header *orig_block)
         block_1->audio_class = 0;
         block_1->video_frame_count = 0; //autodetect
         block_1->audio_frame_count = 0;
-        if (session_fps == 0)
-            block_1->source_fps_nom = 1;
-        else
-            block_1->source_fps_nom = session_fps;
-        block_1->source_fps_denom = 1000;
+        mlv_fps_to_rational(session_fps,
+                            &block_1->source_fps_nom,
+                            &block_1->source_fps_denom);
         return 0;
 
     case mlv_RAWI:
