@@ -2241,6 +2241,308 @@ static int rp_hold_crx_reference(struct rp_frame_slot *source,
                    (uint32_t)(uintptr_t)source->start);
     return 0;
 }
+
+/* RAW-LV and the Canon/ML writer have already been stopped when this runs.
+ * Therefore the extra reference FIO cannot perturb the encoder experiment. */
+static int rp_write_crx_reference_sidecar(void)
+{
+    if (!RP_CRX_ROUNDTRIP_VERIFY)
+        return 0;
+    if (rp_record_codec != RAW_VID_CODEC_CRX)
+        return 0;
+    if (rp_crx_ref_slot == NULL ||
+        rp_crx_ref_slot->state != RP_FRAME_SLOT_REFERENCE)
+    {
+        RP_START_TRACE("CRX REF write missing reference");
+        return -1110;
+    }
+
+    const char *path = rp_crx_ref_path_for_bits(rp_crx_ref_bits);
+    if (path == NULL)
+        return -1111;
+
+    struct rp_crx_ref_header hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.magic, "RPCRXR1", 8u);
+    hdr.version = RP_CRX_REF_VERSION;
+    hdr.width = rp_crx_ref_width;
+    hdr.height = rp_crx_ref_height;
+    hdr.bits_per_pixel = rp_crx_ref_bits;
+    hdr.row_bytes = rp_crx_ref_row_bytes;
+    hdr.payload_bytes = rp_crx_ref_payload_bytes;
+    hdr.frame_number = rp_crx_ref_frame_number;
+    hdr.copy_us = rp_crx_ref_copy_us;
+
+    FIO_RemoveFile(path);
+    FILE *f = FIO_CreateFile(path);
+    if (f == NULL)
+        return -1112;
+
+    uint32_t h_written = FIO_WriteFile(f, &hdr, sizeof(hdr));
+    uint32_t p_written = 0;
+    if (h_written == sizeof(hdr))
+    {
+        p_written = FIO_WriteFile(f, rp_crx_ref_slot->start,
+                                  rp_crx_ref_payload_bytes);
+    }
+    FIO_CloseFile(f);
+
+    int rc = 0;
+    if (h_written != sizeof(hdr) || p_written != rp_crx_ref_payload_bytes)
+        rc = -1113;
+
+    RP_START_TRACE("CRX REF write rc=%d path=%s hdr=%d/%d payload=%d/%d",
+                   rc, path, (int)h_written, (int)sizeof(hdr),
+                   (int)p_written, (int)rp_crx_ref_payload_bytes);
+
+    rp_abandon_frame_slot(rp_crx_ref_slot);
+    rp_crx_ref_slot = NULL;
+    return rc;
+}
+
+/* RP MVP stop path: wait for any outstanding asynchronous full-buffer write,
+ * then synchronously flush the remaining partial buffer(s).  The legacy
+ * raw_vidx path historically dropped this final partial data. */
+static int rp_flush_crop_bufs_on_stop(struct crop_buf crop_bufs[])
+{
+    uint64_t start = (uint64_t)get_us_clock();
+    const uint64_t timeout_us = 3000000u;
+
+    while ((crop_bufs[0].writing || crop_bufs[1].writing) &&
+           ((uint64_t)get_us_clock() - start) < timeout_us)
+    {
+        msleep(10);
+    }
+
+    if (crop_bufs[0].writing || crop_bufs[1].writing)
+        return -1;
+
+    if (raw_vid_fp == NULL)
+        return -2;
+
+    for (int i = 0; i < 2; i++)
+    {
+        if (crop_bufs[i].start && crop_bufs[i].cur > crop_bufs[i].start)
+        {
+            uint32_t size = (uint32_t)(crop_bufs[i].cur - crop_bufs[i].start);
+            FIO_WriteFile(raw_vid_fp, crop_bufs[i].start, size);
+            crop_bufs[i].cur = crop_bufs[i].start;
+        }
+    }
+    return 0;
+}
+
+static int rp_process_frame_slot(struct raw_vid_event *event,
+                                 uint32_t *video_frame_count)
+{
+    struct rp_frame_slot *slot = rp_get_free_frame_slot();
+    if (slot == NULL)
+    {
+        rp_slot_starves++;
+        uint32_t qdepth = 0;
+        msg_queue_count(rp_write_q, &qdepth);
+        RP_START_TRACE("S36 SLOT STARVE count=%d q=%d queued=%d done=%d",
+                       (int)rp_frame_slot_count, (int)qdepth,
+                       (int)rp_writer_jobs_queued, (int)rp_writer_jobs_done);
+        raw_vid_rp_request_stop();
+        raw_vid_request_stop_async();
+        return -1;
+    }
+
+    uint32_t frame_no = *video_frame_count;
+    char *dst = write_video_frame_header_padded((uint32_t)event->size,
+                                                rp_frame_slot_stride,
+                                                slot->start, slot->end);
+    if (dst == NULL)
+    {
+        RP_START_TRACE("S36 SLOT header FAIL frame=%d cap=%d payload=%d",
+                       (int)frame_no, (int)(slot->end - slot->start),
+                       (int)event->size);
+        rp_abandon_frame_slot(slot);
+        raw_vid_rp_request_stop();
+        raw_vid_request_stop_async();
+        return -2;
+    }
+
+    /* blockSize deliberately includes sector padding after the RAW payload.
+     * This is the mlv_lite layout: each slot is a complete MLV block and its
+     * size is exactly the physical slot stride, so adjacent slots can be
+     * written with one FIO call without gaps or copies. */
+    slot->used = rp_frame_slot_stride;
+    slot->frame_number = frame_no;
+    (*video_frame_count)++;
+
+    int err = take_semaphore_now(edmac_sem);
+    if (err)
+    {
+        RP_START_TRACE("S36 SLOT edmac busy frame=%d rc=%d", (int)frame_no, err);
+        rp_abandon_frame_slot(slot);
+        if (*video_frame_count > 0)
+            (*video_frame_count)--;
+        raw_vid_rp_request_stop();
+        raw_vid_request_stop_async();
+        return -3;
+    }
+
+    uint32_t m2m_us = 0;
+    int m2m_rc;
+    m2m_rc = raw_vid_rp_m2m_crop_once(
+        event->src, raw_info.pitch,
+        event->x, event->y, event->w, event->h,
+        dst, (uint32_t)event->size, &m2m_us);
+
+    give_semaphore(edmac_sem);
+
+    if (m2m_rc)
+    {
+        rp_abandon_frame_slot(slot);
+        if (*video_frame_count > 0)
+            (*video_frame_count)--;
+        RP_START_TRACE("S36 SLOT crop FAIL rc=%d us=%d frame=%d",
+                       m2m_rc, (int)m2m_us, (int)frame_no);
+        rp_worker_m2m_failed = 1;
+        raw_vid_rp_request_stop();
+        raw_vid_request_stop_async();
+        return -4;
+    }
+
+    int write_rc = rp_queue_frame_slot_write(slot);
+    if (write_rc)
+    {
+        RP_START_TRACE("S36 SLOT queue FAIL rc=%d frame=%d",
+                       write_rc, (int)frame_no);
+        rp_abandon_frame_slot(slot);
+        raw_vid_rp_request_stop();
+        raw_vid_request_stop_async();
+        return -5;
+    }
+
+    return 0;
+}
+
+// This is the heart of worker.c.
+//
+// This runs as a task whenever the module is loaded,
+// regardless of whether a recording is in progress.
+//
+// It is the only consumer of the message queue. 
+
+static int rp_crx_release_handles(const struct rp_crx_result *result,
+                                  uint32_t *first_rc)
+{
+    if (first_rc)
+        *first_rc = 0;
+    if (!result)
+        return -1;
+
+    uint32_t n = MIN(result->count, RP_CRX_RESULT_MAX);
+    int bad = 0;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        if (!result->handles[i])
+            continue;
+        int rc = raw_vid_rp_crx_free(result->handles[i]);
+        if (i == 0 && first_rc)
+            *first_rc = (uint32_t)rc;
+        if (rc & 1)
+        {
+            rp_crx_release_failures++;
+            bad = rc ? rc : 1;
+        }
+    }
+    return bad;
+}
+
+static uint16_t rp_crx_be16(const uint8_t *p)
+{
+    return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
+
+static uint32_t rp_crx_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+
+/* Validate the opaque Canon CMP1 enough to prove that the stream-level
+ * declaration we write is compatible with this recorder session.
+ *
+ * Return:
+ *   1  first valid CMP1 latched
+ *   0  later CMP1 is byte-identical to the latched configuration
+ *  <0  malformed/incompatible/changed configuration
+ */
+static int rp_crx_validate_and_latch_cmp1(const void *cmp1_ptr,
+                                          uint32_t cmp1_size,
+                                          uint32_t logical_w,
+                                          uint32_t logical_h,
+                                          uint32_t logical_bits,
+                                          uint32_t sample_header_size,
+                                          int lossy)
+{
+    if (!cmp1_ptr || cmp1_size < 32u || cmp1_size > RP_CRX_META_MAX_BYTES)
+        return -1;
+
+    const uint8_t *c = (const uint8_t *)cmp1_ptr;
+    const uint16_t version = rp_crx_be16(c + 4u);
+    const uint32_t coded_w = rp_crx_be32(c + 8u);
+    const uint32_t coded_h = rp_crx_be32(c + 12u);
+    const uint8_t nbits = c[24];
+    const uint8_t nplanes = c[25] >> 4;
+    const uint8_t cfa_layout = c[25] & 0x0Fu;
+    const uint8_t enc_type = c[26] >> 4;
+    const uint8_t image_levels = c[26] & 0x0Fu;
+    const uint32_t mdat_hdr_size = rp_crx_be32(c + 28u);
+
+    int codec_ok = lossy
+        ? (enc_type == 3u || image_levels > 0u)
+        : (enc_type == 0u && image_levels == 0u);
+
+    if ((version != 0x0100u && version != 0x0200u) ||
+        coded_w != logical_w || coded_h != logical_h ||
+        nbits != logical_bits ||
+        nplanes != 4u || cfa_layout > 3u ||
+        !codec_ok ||
+        mdat_hdr_size != sample_header_size)
+    {
+        RP_START_TRACE("CRX CMP1 reject lossy=%d ver=%x wh=%d,%d/%d,%d bits=%d/%d planes=%d cfa=%d enc=%d lev=%d hdr=%d/%d",
+                       lossy ? 1 : 0, (int)version,
+                       (int)coded_w, (int)coded_h,
+                       (int)logical_w, (int)logical_h,
+                       (int)nbits, (int)logical_bits,
+                       (int)nplanes, (int)cfa_layout,
+                       (int)enc_type, (int)image_levels,
+                       (int)mdat_hdr_size, (int)sample_header_size);
+        return -2;
+    }
+
+    /* Current pipeline is explicitly same-domain end-to-end.  Do not infer a
+     * shift from nBits: fail above if that contract changes. */
+    rp_crx_value_shift = RP_CRX_VALUE_SHIFT_CURRENT;
+
+    if (rp_crx_cmp1_size == 0u)
+    {
+        memcpy(rp_crx_cmp1_cache, c, cmp1_size);
+        rp_crx_cmp1_size = cmp1_size;
+        RP_START_TRACE("CRX CMP1 latch lossy=%d size=%d shift=%d wh=%d,%d bits=%d enc=%d lev=%d hdr=%d",
+                       lossy ? 1 : 0, (int)cmp1_size, (int)rp_crx_value_shift,
+                       (int)coded_w, (int)coded_h, (int)nbits,
+                       (int)enc_type, (int)image_levels, (int)mdat_hdr_size);
+        return 1;
+    }
+
+    if (cmp1_size != rp_crx_cmp1_size ||
+        memcmp(rp_crx_cmp1_cache, c, cmp1_size) != 0)
+    {
+        RP_START_TRACE("CRX CMP1 CHANGED old=%d new=%d; stop logical clip",
+                       (int)rp_crx_cmp1_size, (int)cmp1_size);
+        return -3;
+    }
+
+    return 0;
+}
 static void worker(void)
 {
     #ifdef RAW_VID_LOG
