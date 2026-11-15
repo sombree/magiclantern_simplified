@@ -1903,6 +1903,344 @@ static int rp_write_frame_batch_to_disk(struct rp_frame_slot **batch,
     rp_writer_jobs_done += batch_count;
     return io_ok ? 0 : -5;
 }
+
+static struct rp_frame_slot *rp_v110_writer_batch[RP_FRAME_SLOT_MAX];
+/* Writer-only scratch; never allocated on the small DryOS task stack. */
+static uint32_t rp_v113_writer_sizes[RP_FRAME_SLOT_MAX];
+static void rp_writer_task(void)
+{
+    struct rp_frame_slot **batch=rp_v110_writer_batch;
+
+    TASK_LOOP
+    {
+        struct rp_frame_slot *first = NULL;
+        int rc = msg_queue_receive(rp_write_q, &first, 0);
+        if (rc)
+        {
+            RP_START_TRACE("S36 WR receive FAIL rc=%d", rc);
+            continue;
+        }
+
+        if (first == RP_WRITE_HEADER_TOKEN)
+        {
+            uint32_t written = 0u;
+            uint32_t fio_us = 0u;
+            if (raw_vid_fp != NULL &&
+                rp_header_write_ptr != NULL &&
+                rp_header_write_size != 0u)
+            {
+                uint64_t t0 = (uint64_t)get_us_clock();
+                written = FIO_WriteFile(
+                    raw_vid_fp, rp_header_write_ptr, rp_header_write_size);
+                fio_us = (uint32_t)((uint64_t)get_us_clock() - t0);
+            }
+
+            if (written != rp_header_write_size)
+            {
+                rp_header_write_failed = 1u;
+                RP_START_TRACE("S36 REV2 HEADER FAIL req=%d got=%d",
+                               (int)rp_header_write_size, (int)written);
+                raw_vid_rp_request_stop();
+                raw_vid_request_stop_async();
+            }
+            else
+            {
+                rp_header_write_done = 1u;
+                RP_START_TRACE("S36 REV2 HEADER wrote=%d us=%d",
+                               (int)written, (int)fio_us);
+            }
+
+            rp_header_write_pending = 0u;
+            continue;
+        }
+
+        if (first == NULL)
+        {
+            RP_START_TRACE("S36 WR receive NULL");
+            continue;
+        }
+
+        if (first->state != RP_FRAME_SLOT_FULL)
+        {
+            RP_START_TRACE("S36 WR state FAIL frame=%d state=%d",
+                           (int)first->frame_number, (int)first->state);
+            raw_vid_rp_request_stop();
+            raw_vid_request_stop_async();
+            continue;
+        }
+
+        uint32_t candidate =
+            rp_collect_contiguous_full_slots(first, batch, RP_FRAME_SLOT_MAX);
+        if (candidate == 0u)
+        {
+            RP_START_TRACE("S36 BATCH collect FAIL frame=%d",
+                           (int)first->frame_number);
+            raw_vid_rp_request_stop();
+            raw_vid_request_stop_async();
+            continue;
+        }
+
+        uint32_t free_slots = rp_count_free_frame_slots();
+        struct rp_v112_decision pressure = rp_v112_writer_pressure(free_slots);
+        uint32_t target_bytes = rp_adapt_target(
+            &rp_adapt, free_slots, rp_writer_drain_requested != 0u);
+        if (pressure.level >= RP_V112_PRESSURE_HIGH)
+            target_bytes = rp_adapt_sizes_bytes[rp_adapt.allowed_index];
+        uint32_t coalesce_wait_us = 0u;
+        candidate = rp_wait_for_coalesce(
+            first, batch, candidate, free_slots, target_bytes,
+            &pressure, &coalesce_wait_us);
+        free_slots = rp_count_free_frame_slots();
+
+        uint32_t candidate_bytes = rp_batch_bytes(batch, candidate);
+        uint32_t allowed_bytes = (rp_adapt.allowed_index ==
+            RP_ADAPT_SAFE_LAST_BUCKET)
+            ? (0xFFFEu * 512u)
+            : rp_adapt_sizes_bytes[rp_adapt.allowed_index];
+        uint32_t to_target = rp_select_target_prefix(
+            batch, candidate, target_bytes, allowed_bytes);
+        if (!to_target)
+        {
+            RP_START_TRACE("S36 ADAPT first frame exceeds cap used=%d cap=%d",
+                           (int)first->used, (int)allowed_bytes);
+            rp_writer_drain_requested = 1u;
+            raw_vid_rp_request_stop();
+            raw_vid_request_stop_async();
+            continue;
+        }
+        pressure = rp_v112_writer_pressure(free_slots);
+        /* v113: the first READY prefix that completes FIO soon enough to
+         * return slots before a no-progress overflow. Do not change the
+         * adaptive size cap or merge across different Canon memory owners. */
+        struct rp_v113_input vin;
+        struct rp_v113_choice choice;
+        vin.free_bytes = rp_v112_free_bytes();
+        vin.free_slots = free_slots;
+        vin.ingress_x100 = rp_writer_ingress_rate_x100;
+        vin.fps_x1000 = session.fps > 0 ? (uint32_t)session.fps : 0u;
+        vin.fallback_rate_x100 = rp_writer_rate_x100;
+        vin.draining = rp_writer_drain_requested;
+        vin.pressure = &pressure;
+        vin.history = &rp_v113_io_history;
+        for (uint32_t i = 0; i < to_target; ++i)
+            rp_v113_writer_sizes[i] = batch[i]->used;
+        rp_v113_select_prefix(&vin, rp_v113_writer_sizes, to_target, &choice);
+        uint32_t selected = choice.frames;
+        if (!selected)
+        {
+            RP_START_TRACE("S36 V113 invalid-prefix n=%d", (int)to_target);
+            raw_vid_rp_request_stop();
+            raw_vid_request_stop_async();
+            continue;
+        }
+        RP_START_TRACE("S36 V113 p=%d freeKB=%d slots=%d n=%d/%d",
+                       (int)pressure.level, (int)(vin.free_bytes / 1024u),
+                       (int)free_slots, (int)selected, (int)to_target);
+        RP_START_TRACE("S36 V113 time budget=%d pred=%d noRel=%d",
+                       choice.budget_us == UINT32_MAX ? -1 : (int)(choice.budget_us / 1000u),
+                       (int)(choice.predicted_us / 1000u),
+                       choice.no_release_us == UINT32_MAX ? -1 : (int)(choice.no_release_us / 1000u));
+        RP_START_TRACE("S36 V113 rate=%d.%02d warn=%d tail=%d fb=%d",
+                       (int)(choice.conservative_rate_x100 / 100u),
+                       (int)(choice.conservative_rate_x100 % 100u),
+                       (int)choice.budget_exceeded,
+                       (int)rp_v112_tail_hits, (int)rp_v112_fallbacks);
+
+        if (rp_consume_group_queue_tokens(batch, selected))
+        {
+            raw_vid_rp_request_stop();
+            raw_vid_request_stop_async();
+            continue;
+        }
+
+        uint32_t selected_bytes = rp_batch_bytes(batch, selected);
+        uint32_t qdepth = 0;
+        msg_queue_count(rp_write_q, &qdepth);
+        RP_START_TRACE("S36 BATCH select first=%d candidate=%d/%dKB n=%d/%dKB q=%d free=%d reserved=%d wait=%d",
+                       (int)first->frame_number,
+                       (int)candidate, (int)(candidate_bytes / 1024u),
+                       (int)selected, (int)(selected_bytes / 1024u),
+                       (int)qdepth, (int)free_slots,
+                       (int)rp_count_reserved_frame_slots(),
+                       (int)coalesce_wait_us);
+
+        RP_START_TRACE("S36 ADAPT target=%dKB cap=%dKB ingress=%d.%02d drain=%d.%02d fio=%d.%02d eff=%d.%02d free=%d probe=%d stop=%d",
+                       (int)(target_bytes / 1024u),
+                       (int)(rp_adapt_sizes_bytes[rp_adapt.allowed_index] / 1024u),
+                       (int)(rp_writer_ingress_rate_x100 / 100u),
+                       (int)(rp_writer_ingress_rate_x100 % 100u),
+                       (int)(rp_writer_drain_rate_x100 / 100u),
+                       (int)(rp_writer_drain_rate_x100 % 100u),
+                       (int)(rp_adapt.last_write_rate_x100 / 100u),
+                       (int)(rp_adapt.last_write_rate_x100 % 100u),
+                       (int)(rp_adapt.last_effective_rate_x100 / 100u),
+                       (int)(rp_adapt.last_effective_rate_x100 % 100u),
+                       (int)free_slots, (int)rp_adapt.probe_attempts,
+                       (int)rp_writer_drain_requested);
+        int write_rc = rp_write_frame_batch_to_disk(
+            batch, selected, coalesce_wait_us);
+        if (write_rc)
+        {
+            RP_START_TRACE("S36 ADAPT write abort rc=%d", write_rc);
+            rp_writer_drain_requested = 1u;
+            raw_vid_rp_request_stop();
+            raw_vid_request_stop_async();
+        }
+        RP_START_TRACE("S36 WR complete done=%d queued=%d free=%d reserved=%d",
+                       (int)rp_writer_jobs_done,
+                       (int)rp_writer_jobs_queued,
+                       (int)rp_count_free_frame_slots(),
+                       (int)rp_count_reserved_frame_slots());
+    }
+}
+
+/* No disk operations, no W3/PU MMIO. Safe to call after the recorder
+ * reaches INACTIVE or during the between-case cooldown. Zero counters in an
+ * active new session do not themselves count as idle: also check state/file. */
+void raw_vid_rp_writer_get_status(struct raw_vid_rp_writer_status *status)
+{
+    if (!status) return;
+    memset(status,0,sizeof(*status));
+    status->queued = rp_writer_jobs_queued;
+    status->done = rp_writer_jobs_done;
+    status->header_pending = rp_header_write_pending;
+    status->io_fail = rp_writer_io_fail;
+    status->post_fail = rp_writer_post_fail;
+    status->batches = rp_writer_batches;
+    status->max_batch_bytes = rp_writer_max_batch_bytes;
+    status->max_write_us = rp_writer_max_us;
+    status->rate_mb_s_x100 = rp_writer_rate_x100;
+    status->ingress_mb_s_x100 = rp_writer_ingress_rate_x100;
+    status->drain_mb_s_x100 = rp_writer_drain_rate_x100;
+    status->adaptive_target_bytes = rp_adapt.last_target_bytes;
+    status->adaptive_allowed_bytes =
+        rp_adapt_sizes_bytes[rp_adapt.allowed_index];
+    status->file_open = raw_vid_fp != NULL;
+    /* Failure to inspect the queue is NOT an idle state. */
+    if (!rp_write_q || msg_queue_count(rp_write_q,&status->queue_depth))
+        status->queue_depth = 0xffffffffu;
+    status->idle = (get_recording_state() == INACTIVE &&
+                    status->queued == status->done &&
+                    !status->queue_depth && !status->header_pending &&
+                    !rp_header_write_failed && !status->io_fail &&
+                    !status->post_fail && !status->file_open);
+}
+
+static int rp_drain_frame_slots_on_stop(void)
+{
+    uint64_t start = (uint64_t)get_us_clock();
+    uint64_t timeout_us = 7000000u;
+    uint32_t pending = rp_writer_jobs_queued - rp_writer_jobs_done;
+    uint32_t speed = rp_writer_rate_x100;
+    if (speed && pending && rp_writer_recent_frame_bytes)
+    {
+        uint64_t expected_us =
+            ((uint64_t)pending * rp_writer_recent_frame_bytes * 100ull) / speed;
+        uint64_t predicted_us = expected_us * 2ull + 3000000ull;
+        if (predicted_us > timeout_us) timeout_us = predicted_us;
+        if (timeout_us > 30000000ull) timeout_us = 30000000ull;
+    }
+    RP_START_TRACE("S36 ADAPT drain pending=%d limit_us=%d",
+                   (int)pending, (int)timeout_us);
+
+    while ((rp_writer_jobs_done != rp_writer_jobs_queued ||
+            rp_header_write_pending) &&
+           ((uint64_t)get_us_clock() - start) < timeout_us)
+    {
+        msleep(10);
+    }
+
+    if (rp_writer_jobs_done != rp_writer_jobs_queued ||
+        rp_header_write_pending || rp_header_write_failed)
+    {
+        return -1;
+    }
+
+    if (rp_slot_lock())
+        return -2;
+
+    int bad = 0;
+    for (uint32_t i = 0; i < rp_frame_slot_count; i++)
+    {
+        if (rp_frame_slots[i].state == RP_FRAME_SLOT_FREE ||
+            rp_frame_slots[i].state == RP_FRAME_SLOT_RESERVED)
+        {
+            continue;
+        }
+
+        if (RP_CRX_ROUNDTRIP_VERIFY &&
+            &rp_frame_slots[i] == rp_crx_ref_slot &&
+            rp_frame_slots[i].state == RP_FRAME_SLOT_REFERENCE)
+        {
+            continue;
+        }
+
+        bad = 1;
+        break;
+    }
+    rp_slot_unlock();
+    return bad ? -3 : 0;
+}
+
+static const char *rp_crx_ref_path_for_bits(uint32_t bits)
+{
+    if (bits == 10u) return "ML/LOGS/RPCRX10.BIN";
+    if (bits == 12u) return "ML/LOGS/RPCRX12.BIN";
+    if (bits == 14u) return "ML/LOGS/RPCRX14.BIN";
+    return NULL;
+}
+
+static int rp_hold_crx_reference(struct rp_frame_slot *source,
+                                 uint32_t width, uint32_t height,
+                                 uint32_t bits, uint32_t frame_number,
+                                 uint32_t payload_bytes)
+{
+    if (!RP_CRX_ROUNDTRIP_VERIFY)
+        return 0;
+    if (source == NULL || rp_crx_ref_slot != NULL)
+        return -1100;
+    if (bits != 10u && bits != 12u && bits != 14u)
+        return -1101;
+
+    uint32_t row_bits = width * bits;
+    if ((row_bits & 7u) != 0u)
+        return -1102;
+    uint32_t row_bytes = row_bits / 8u;
+    if (row_bytes == 0u || height == 0u ||
+        (uint64_t)row_bytes * height != payload_bytes)
+        return -1103;
+
+    if (source->state != RP_FRAME_SLOT_CAPTURING)
+        return -1104;
+
+    uint32_t capacity = (uint32_t)(source->end - source->start);
+    if (payload_bytes > capacity)
+        return -1105;
+
+    /*
+     * v7 zero-copy round-trip reference:
+     * this is the exact tight input buffer that StartEncode just consumed.
+     * Keep the slot intact and build the revision-2 VIDF in a second output slot.
+     */
+    source->used = payload_bytes;
+    source->frame_number = frame_number;
+    source->state = RP_FRAME_SLOT_REFERENCE;
+
+    rp_crx_ref_slot = source;
+    rp_crx_ref_width = width;
+    rp_crx_ref_height = height;
+    rp_crx_ref_bits = bits;
+    rp_crx_ref_row_bytes = row_bytes;
+    rp_crx_ref_payload_bytes = payload_bytes;
+    rp_crx_ref_frame_number = frame_number;
+    rp_crx_ref_copy_us = 0;
+
+    RP_START_TRACE("CRX REF ZERO-COPY PASS f=%d bpp=%d wh=%d,%d row=%d bytes=%d slot=%x",
+                   (int)frame_number, (int)bits, (int)width, (int)height,
+                   (int)row_bytes, (int)payload_bytes,
+                   (uint32_t)(uintptr_t)source->start);
+    return 0;
+}
 static void worker(void)
 {
     #ifdef RAW_VID_LOG
